@@ -1,0 +1,15 @@
+# Arduino IDE
+*.hex
+*.elf
+*.eep
+build/
+*.o
+*.a
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+*.swp
+*~
+.vscode/
+.idea/
