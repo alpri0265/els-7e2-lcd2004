@@ -21,7 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "lcd_hd44780.h"
+#include "menu_keys.h"
+#include "els_menu.h"
+#include "main.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -72,6 +75,10 @@ static void MX_TIM9_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+static lcd_hd44780_t g_lcd;
+static menu_keys_t g_keys;
+static els_menu_t g_menu;
+
 /* USER CODE END 0 */
 
 /**
@@ -113,6 +120,25 @@ int main(void)
   MX_TIM9_Init();
   /* USER CODE BEGIN 2 */
 
+  g_lcd.rs_port = LCD_RS_GPIO_Port; g_lcd.rs_pin = LCD_RS_Pin;
+  g_lcd.e_port  = LCD_E_GPIO_Port;  g_lcd.e_pin  = LCD_E_Pin;
+  g_lcd.d4_port = LCD_D4_GPIO_Port; g_lcd.d4_pin = LCD_D4_Pin;
+  g_lcd.d5_port = LCD_D5_GPIO_Port; g_lcd.d5_pin = LCD_D5_Pin;
+  g_lcd.d6_port = LCD_D6_GPIO_Port; g_lcd.d6_pin = LCD_D6_Pin;
+  g_lcd.d7_port = LCD_D7_GPIO_Port; g_lcd.d7_pin = LCD_D7_Pin;
+  lcd_hd44780_init(&g_lcd);
+
+  g_keys.port_l = BTN_MENU_L_GPIO_Port; g_keys.pin_l = BTN_MENU_L_Pin;
+  g_keys.port_r = BTN_MENU_R_GPIO_Port; g_keys.pin_r = BTN_MENU_R_Pin;
+  g_keys.port_u = BTN_MENU_U_GPIO_Port; g_keys.pin_u = BTN_MENU_U_Pin;
+  g_keys.port_d = BTN_MENU_D_GPIO_Port; g_keys.pin_d = BTN_MENU_D_Pin;
+  g_keys.port_sel = BTN_MENU_SEL_GPIO_Port; g_keys.pin_sel = BTN_MENU_SEL_Pin;
+  menu_keys_init(&g_keys, 30);
+
+  els_menu_init(&g_menu, &g_lcd, &g_keys);
+  g_menu.mode_port = GPIOG;
+  g_menu.submode_port = GPIOD;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -122,6 +148,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* Arduino: if (SelectMenu == 0) Read_ADC_Feed(); */
+    if (g_menu.select_menu == 0)
+    {
+      if (HAL_ADC_Start(&hadc3) == HAL_OK)
+      {
+        if (HAL_ADC_PollForConversion(&hadc3, 2) == HAL_OK)
+        {
+          uint32_t adc12 = HAL_ADC_GetValue(&hadc3); /* 0..4095 */
+          uint16_t adc10 = (uint16_t)(adc12 >> 2);  /* map to 0..1023 */
+          els_menu_set_adc_raw10(&g_menu, adc10);
+        }
+        (void)HAL_ADC_Stop(&hadc3);
+      }
+    }
+
+    els_menu_update(&g_menu, HAL_GetTick());
   }
   /* USER CODE END 3 */
 }

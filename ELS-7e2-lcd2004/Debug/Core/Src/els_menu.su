@@ -1,0 +1,15 @@
+../Core/Src/els_menu.c:14:13:lcd_write_padded	24	static
+../Core/Src/els_menu.c:25:13:lcd_put_custom	16	static
+../Core/Src/els_menu.c:30:13:els_beep_stub	4	static
+../Core/Src/els_menu.c:35:13:key_select_pressed	16	static
+../Core/Src/els_menu.c:64:13:key_up_pressed	16	static
+../Core/Src/els_menu.c:136:13:key_down_pressed	16	static
+../Core/Src/els_menu.c:209:13:key_left_pressed	16	static
+../Core/Src/els_menu.c:263:13:key_right_pressed	16	static
+../Core/Src/els_menu.c:317:13:handle_key_event	16	static
+../Core/Src/els_menu.c:331:6:els_menu_init	32	static
+../Core/Src/els_menu.c:386:6:els_menu_set_adc_raw10	24	static
+../Core/Src/els_menu.c:422:16:read_mode_byte	24	static
+../Core/Src/els_menu.c:429:16:read_submode_bits	24	static
+../Core/Src/els_menu.c:440:6:els_menu_update	24	static
+../Core/Src/els_menu.c:525:6:els_menu_render	152	static

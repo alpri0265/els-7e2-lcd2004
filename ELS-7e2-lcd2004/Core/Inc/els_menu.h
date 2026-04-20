@@ -1,0 +1,99 @@
+#ifndef ELS_MENU_H
+#define ELS_MENU_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "lcd_hd44780.h"
+#include "menu_keys.h"
+#include "lcd_rus.h"
+#include "els_model.h"
+
+typedef enum
+{
+	ELS_MODE_FEED = 1,
+	ELS_MODE_AFEED,
+	ELS_MODE_THREAD,
+	ELS_MODE_CONE_L,
+	ELS_MODE_CONE_R,
+	ELS_MODE_SPHERE,
+	ELS_MODE_TACHO,
+	ELS_MODE_RESERVE
+} els_mode_t;
+
+typedef enum { ELS_SUB_INT = 1, ELS_SUB_MAN, ELS_SUB_EXT } els_submode_t;
+
+typedef struct
+{
+	lcd_hd44780_t *lcd;
+	lcd_rus_t rus;
+	menu_keys_t *keys;
+
+	/* timing (ms) to mimic Arduino KeyCycle behavior */
+	uint32_t repeat_enter_ms;
+	uint32_t repeat_rate_ms;
+
+	/* key repeat state */
+	uint8_t last_pressed_mask;
+	uint32_t pressed_since_ms;
+	uint32_t last_repeat_ms;
+
+	/* menu state */
+	els_mode_t mode;
+	els_submode_t sub_thread;
+	els_submode_t sub_feed;
+	els_submode_t sub_afeed;
+	els_submode_t sub_cone;
+	els_submode_t sub_sphere; /* still uses INT/MAN/EXT in UI */
+
+	uint8_t select_menu; /* 0..2 */
+
+	/* variables adjusted from menu */
+	int ap;               /* like Ap in sketch (0..900) */
+	int pass_total;       /* 1..99 */
+	int pass_nr;          /* current pass number (1..) */
+	int pass_fin;         /* finish passes modifier */
+	int thr_pass_summ;    /* extra passes */
+	long pass_total_sphr; /* sphere passes */
+	uint8_t total_tooth;  /* 1..255 */
+	uint8_t current_tooth;/* 1..total_tooth */
+	uint8_t thread_step;  /* index into Thread_Info (not fully ported) */
+	uint8_t cone_step;    /* index into Cone_Info (not fully ported) */
+	long sph_r_mm;        /* sphere radius in 0.01mm (as in sketch) */
+	long bar_r_mm;        /* leg diameter/2 in 0.01mm */
+	uint8_t cutter_step;
+	uint8_t cutting_step;
+	int enc_pos;          /* encoder position for angle display */
+	uint32_t duration;    /* tachometer pulse width placeholder */
+
+	/* ADC feed smoothing like Arduino */
+	uint16_t adc_feed;      /* 0..1023 like Arduino */
+	uint32_t sum_adc;
+	uint16_t adc_array[16];
+	uint8_t adc_idx;
+
+	/* derived values shown on screen */
+	uint16_t feed_mm;   /* сотки мм/об (MIN_FEED..MAX_FEED) */
+	uint16_t afeedback_mm; /* mm/min (MIN_aFEED..MAX_aFEED) */
+
+	/* positions (hundredths of mm in sketch; here just counters) */
+	long x_pos;
+	long z_pos;
+
+	/* status flags */
+	bool err_1;
+	bool err_2;
+	bool complete;
+
+	/* raw switches (active-low like Arduino) */
+	GPIO_TypeDef *mode_port;
+	GPIO_TypeDef *submode_port;
+} els_menu_t;
+
+void els_menu_init(els_menu_t *m, lcd_hd44780_t *lcd, menu_keys_t *keys);
+void els_menu_update(els_menu_t *m, uint32_t now_ms);
+void els_menu_render(els_menu_t *m);
+void els_menu_set_adc_raw10(els_menu_t *m, uint16_t adc10);
+
+#endif
+

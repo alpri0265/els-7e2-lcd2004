@@ -1,0 +1,7 @@
+../Core/Src/lcd_rus.c:16:6:lcd_rus_init	1
+../Core/Src/lcd_rus.c:22:6:lcd_rus_set_cursor	1
+../Core/Src/lcd_rus.c:27:6:lcd_rus_clear	1
+../Core/Src/lcd_rus.c:32:6:lcd_rus_write_u8	1
+../Core/Src/lcd_rus.c:37:6:lcd_rus_write_char	1
+../Core/Src/lcd_rus.c:42:13:lcd_rus_write_byte	8
+../Core/Src/lcd_rus.c:82:6:lcd_rus_write_utf8	3

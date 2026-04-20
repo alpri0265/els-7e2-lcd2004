@@ -1,0 +1,6 @@
+../Core/Src/menu_keys.c:3:16:keys_read_raw_mask	6
+../Core/Src/menu_keys.c:15:19:first_pressed_edge	6
+../Core/Src/menu_keys.c:26:6:menu_keys_init	1
+../Core/Src/menu_keys.c:35:6:menu_keys_update	5
+../Core/Src/menu_keys.c:61:12:menu_keys_pop_event	1
+../Core/Src/menu_keys.c:68:9:menu_keys_get_pressed_mask	1
