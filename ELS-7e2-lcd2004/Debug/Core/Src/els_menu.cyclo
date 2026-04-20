@@ -8,8 +8,10 @@
 ../Core/Src/els_menu.c:263:13:key_right_pressed	17
 ../Core/Src/els_menu.c:317:13:handle_key_event	6
 ../Core/Src/els_menu.c:331:6:els_menu_init	2
-../Core/Src/els_menu.c:386:6:els_menu_set_adc_raw10	12
-../Core/Src/els_menu.c:422:16:read_mode_byte	1
-../Core/Src/els_menu.c:429:16:read_submode_bits	1
-../Core/Src/els_menu.c:440:6:els_menu_update	23
-../Core/Src/els_menu.c:525:6:els_menu_render	56
+../Core/Src/els_menu.c:396:16:joy_read_nibble	6
+../Core/Src/els_menu.c:409:13:els_joystick_handle	5
+../Core/Src/els_menu.c:424:6:els_menu_set_adc_raw10	12
+../Core/Src/els_menu.c:460:16:read_mode_byte	1
+../Core/Src/els_menu.c:467:16:read_submode_bits	1
+../Core/Src/els_menu.c:478:6:els_menu_update	27
+../Core/Src/els_menu.c:584:6:els_menu_render	56
