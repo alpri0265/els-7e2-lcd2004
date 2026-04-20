@@ -138,6 +138,11 @@ int main(void)
   els_menu_init(&g_menu, &g_lcd, &g_keys);
   g_menu.mode_port = GPIOG;
   g_menu.submode_port = GPIOD;
+  g_menu.joy_port = JOY_L_GPIO_Port; /* GPIOF */
+  g_menu.joy_pin_l = JOY_L_Pin;
+  g_menu.joy_pin_r = JOY_R_Pin;
+  g_menu.joy_pin_u = JOY_U_Pin;
+  g_menu.joy_pin_d = JOY_D_Pin;
 
   /* USER CODE END 2 */
 

@@ -88,6 +88,16 @@ typedef struct
 	/* raw switches (active-low like Arduino) */
 	GPIO_TypeDef *mode_port;
 	GPIO_TypeDef *submode_port;
+
+	/* joystick (active-low, pull-up) */
+	GPIO_TypeDef *joy_port;
+	uint16_t joy_pin_l;
+	uint16_t joy_pin_r;
+	uint16_t joy_pin_u;
+	uint16_t joy_pin_d;
+	uint8_t joy_old_nibble; /* like Arduino Joy_Read low-nibble */
+	uint32_t joy_last_change_ms;
+	uint32_t joy_debounce_ms;
 } els_menu_t;
 
 void els_menu_init(els_menu_t *m, lcd_hd44780_t *lcd, menu_keys_t *keys);

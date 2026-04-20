@@ -364,6 +364,16 @@ void els_menu_init(els_menu_t *m, lcd_hd44780_t *lcd, menu_keys_t *keys)
 	m->enc_pos = 0;
 	m->duration = 0;
 
+	/* joystick defaults */
+	m->joy_port = 0;
+	m->joy_pin_l = 0;
+	m->joy_pin_r = 0;
+	m->joy_pin_u = 0;
+	m->joy_pin_d = 0;
+	m->joy_old_nibble = 0x0F;
+	m->joy_last_change_ms = 0;
+	m->joy_debounce_ms = 30;
+
 	/* ADC initial state (like Arduino 16-sample average) */
 	m->adc_feed = 0;
 	m->sum_adc = 0;
@@ -381,6 +391,34 @@ void els_menu_init(els_menu_t *m, lcd_hd44780_t *lcd, menu_keys_t *keys)
 	lcd_hd44780_create_char(lcd, 6, chr_diam);
 
 	els_menu_render(m);
+}
+
+static uint8_t joy_read_nibble(const els_menu_t *m)
+{
+	/* bit0=L, bit1=R, bit2=U, bit3=D; 1=released, 0=pressed (pull-up) */
+	uint8_t n = 0x0F;
+	if (!m->joy_port) return 0x0F;
+
+	if (HAL_GPIO_ReadPin(m->joy_port, m->joy_pin_l) == GPIO_PIN_RESET) n &= (uint8_t)~(1U << 0);
+	if (HAL_GPIO_ReadPin(m->joy_port, m->joy_pin_r) == GPIO_PIN_RESET) n &= (uint8_t)~(1U << 1);
+	if (HAL_GPIO_ReadPin(m->joy_port, m->joy_pin_u) == GPIO_PIN_RESET) n &= (uint8_t)~(1U << 2);
+	if (HAL_GPIO_ReadPin(m->joy_port, m->joy_pin_d) == GPIO_PIN_RESET) n &= (uint8_t)~(1U << 3);
+	return n;
+}
+
+static void els_joystick_handle(els_menu_t *m, uint8_t joy_nibble)
+{
+	/*
+	 * Arduino patterns:
+	 * 0b1110 (0x0E) left, 0b1101 (0x0D) right, 0b1011 (0x0B) up, 0b0111 (0x07) down, 0b1111 (0x0F) none
+	 *
+	 * For now we map joystick directions to menu navigation keys.
+	 */
+	if (joy_nibble == 0x0E) handle_key_event(m, MENU_KEY_L);
+	else if (joy_nibble == 0x0D) handle_key_event(m, MENU_KEY_R);
+	else if (joy_nibble == 0x0B) handle_key_event(m, MENU_KEY_U);
+	else if (joy_nibble == 0x07) handle_key_event(m, MENU_KEY_D);
+	else { /* 0x0F or multi-press: ignore */ }
 }
 
 void els_menu_set_adc_raw10(els_menu_t *m, uint16_t adc10)
@@ -446,6 +484,27 @@ void els_menu_update(els_menu_t *m, uint32_t now_ms)
 	if (e != MENU_KEY_NONE)
 	{
 		handle_key_event(m, e);
+	}
+
+	/* Joystick (debounced, edge on change like Arduino) */
+	if (m->joy_port)
+	{
+		uint8_t joy_new = joy_read_nibble(m);
+		if (joy_new != m->joy_old_nibble)
+		{
+			m->joy_old_nibble = joy_new;
+			m->joy_last_change_ms = now_ms;
+		}
+		else if ((now_ms - m->joy_last_change_ms) >= m->joy_debounce_ms)
+		{
+			/* stable state: act (only on pressed directions) */
+			if (joy_new != 0x0F)
+			{
+				els_joystick_handle(m, joy_new);
+				/* prevent repeat spam while held */
+				m->joy_last_change_ms = now_ms + 1000000U;
+			}
+		}
 	}
 
 	/* Mode switch (active-low patterns like Arduino) */
