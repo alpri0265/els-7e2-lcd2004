@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include "LiquidCrystalRus.h"
+#include <LiquidCrystal.h>
 #include "menu.h"
 
 // Піни LCD на Port E (відповідно до main.h з оригінального проекту)
@@ -18,10 +18,59 @@
 #define BTN_SEL   PB12
 
 // Ініціалізація дисплея
-LiquidCrystalRus lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
 // Ініціалізація менеджера меню
 MenuManager menu(lcd);
+
+static void forceLcdPulseEnable() {
+  digitalWrite(LCD_EN, LOW);
+  delayMicroseconds(250);
+  digitalWrite(LCD_EN, HIGH);
+  delayMicroseconds(2500);
+  digitalWrite(LCD_EN, LOW);
+  delayMicroseconds(25000);
+}
+
+static void forceLcdWrite4(uint8_t nibble) {
+  digitalWrite(LCD_D4, (nibble >> 0) & 0x01);
+  digitalWrite(LCD_D5, (nibble >> 1) & 0x01);
+  digitalWrite(LCD_D6, (nibble >> 2) & 0x01);
+  digitalWrite(LCD_D7, (nibble >> 3) & 0x01);
+  delayMicroseconds(2500);
+  forceLcdPulseEnable();
+}
+
+void forceLcdReset() {
+  // Manual HD44780 4-bit init sequence (robust for fast MCUs / 3.3V logic).
+  pinMode(LCD_RS, OUTPUT);
+  pinMode(LCD_EN, OUTPUT);
+  pinMode(LCD_D4, OUTPUT);
+  pinMode(LCD_D5, OUTPUT);
+  pinMode(LCD_D6, OUTPUT);
+  pinMode(LCD_D7, OUTPUT);
+
+  digitalWrite(LCD_RS, LOW);
+  digitalWrite(LCD_EN, LOW);
+  digitalWrite(LCD_D4, LOW);
+  digitalWrite(LCD_D5, LOW);
+  digitalWrite(LCD_D6, LOW);
+  digitalWrite(LCD_D7, LOW);
+
+  delay(60); // >40ms after power-up (and give LCD time after MCU reset)
+
+  // We start in 8-bit mode: send 0x3 (high nibble) three times
+  forceLcdWrite4(0x03);
+  delay(6);  // >4.1ms
+  forceLcdWrite4(0x03);
+  delay(6);  // >4.1ms
+  forceLcdWrite4(0x03);
+  delay(2);  // >100us
+
+  // Switch to 4-bit mode: send 0x2 (high nibble)
+  forceLcdWrite4(0x02);
+  delay(2);
+}
 
 // Функція зчитування фізичного стану кнопок
 // Повертає байт, де кожен біт відповідає за свою кнопку (1 - натиснуто, 0 - відпущено)
@@ -94,8 +143,12 @@ void setup() {
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_SEL, INPUT_PULLUP);
 
+  forceLcdReset();
+
   // Ініціалізація LCD та меню
   menu.init();
+  lcd.noCursor();
+  lcd.noBlink();
   
   // Виводимо початковий екран
   menu.render();

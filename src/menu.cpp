@@ -10,7 +10,7 @@ static const uint8_t chr_down[8]   = {0x00,0x04,0x04,0x15,0x0E,0x04,0x00,0x00};
 static const uint8_t chr_degree[8] = {0x0C,0x12,0x12,0x0C,0x00,0x00,0x00,0x00};
 static const uint8_t chr_diam[8]   = {0x01,0x0E,0x13,0x15,0x19,0x0E,0x10,0x00};
 
-MenuManager::MenuManager(LiquidCrystalRus& lcd_ref) : lcd(lcd_ref)
+MenuManager::MenuManager(LiquidCrystal& lcd_ref) : lcd(lcd_ref)
 {
 	mode = ELS_MODE_FEED;
 	sub_feed = ELS_SUB_MAN;
@@ -204,24 +204,24 @@ void MenuManager::render()
 
 	if (err_1)
 	{
-		lcd.setCursor(0, 0); writePadded("BHИMAHИE:");
+		lcd.setCursor(0, 0); writePadded("WARNING:");
 		lcd.setCursor(0, 1); writePadded("");
-		lcd.setCursor(0, 2); writePadded("    УПOPЫ HE 3AДAHЫ!");
+		lcd.setCursor(0, 2); writePadded("   STOPS NOT SET!   ");
 		lcd.setCursor(0, 3); writePadded("");
 		return;
 	}
 	if (err_2)
 	{
-		lcd.setCursor(0, 0); writePadded("Установите суппорт");
+		lcd.setCursor(0, 0); writePadded("Set carriage to     ");
 		lcd.setCursor(0, 1); writePadded("");
-		lcd.setCursor(0, 2); writePadded(" в исходную позицию!");
+		lcd.setCursor(0, 2); writePadded("    home position!  ");
 		lcd.setCursor(0, 3); writePadded("");
 		return;
 	}
 	if (complete)
 	{
 		lcd.setCursor(0, 0); writePadded("");
-		lcd.setCursor(0, 1); writePadded("OПEPAЦИЯ 3ABEPШEHA!");
+		lcd.setCursor(0, 1); writePadded("OPERATION COMPLETED!");
 		lcd.setCursor(0, 2); writePadded("");
 		lcd.setCursor(0, 3); writePadded("");
 		return;
@@ -232,25 +232,25 @@ void MenuManager::render()
 		if (select_menu == 0)
 		{
 			lcd.setCursor(0, 0);
-			lcd.print("СИНХРОННЫЙ ");
+			lcd.print("SYNCHRONOUS ");
 			
-			if (sub_feed == ELS_SUB_INT) { lcd.setCursor(11, 0); lcd.print("  Внутр. "); }
-			else if (sub_feed == ELS_SUB_MAN) { lcd.setCursor(11, 0); lcd.print("  Ручной "); }
-			else if (sub_feed == ELS_SUB_EXT) { lcd.setCursor(11, 0); lcd.print("  Наружн."); }
+			if (sub_feed == ELS_SUB_INT) { lcd.setCursor(11, 0); lcd.print(" Internal"); }
+			else if (sub_feed == ELS_SUB_MAN) { lcd.setCursor(11, 0); lcd.print(" Manual  "); }
+			else if (sub_feed == ELS_SUB_EXT) { lcd.setCursor(11, 0); lcd.print(" External"); }
 
 			lcd.setCursor(0, 1);
-			snprintf(buf, sizeof(buf), "Подача,  мм/об: %d.%02d", feed_mm/100, feed_mm%100);
+			snprintf(buf, sizeof(buf), "Feed,  mm/rev: %d.%02d", feed_mm/100, feed_mm%100);
 			writePadded(buf);
 
 			lcd.setCursor(0, 2);
 			if (sub_feed == ELS_SUB_MAN)
-				snprintf(buf, sizeof(buf), "Проходов всего:   %2d", pass_total);
+				snprintf(buf, sizeof(buf), "Passes total:     %2d", pass_total);
 			else
-				snprintf(buf, sizeof(buf), "Проходов осталось:%2d", pass_total - pass_nr + 1);
+				snprintf(buf, sizeof(buf), "Passes left:      %2d", pass_total - pass_nr + 1);
 			writePadded(buf);
 
 			lcd.setCursor(0, 3);
-			snprintf(buf, sizeof(buf), "Съём на диаметр: %d.%01d", ap/100, ap%100);
+			snprintf(buf, sizeof(buf), "Depth per pass:  %d.%01d", ap/100, ap%100);
 			writePadded(buf);
 		}
 		else if (select_menu == 1)
@@ -259,11 +259,11 @@ void MenuManager::render()
 			lcd.setCursor(0, 1); writePadded("");
 			
 			lcd.setCursor(0, 2);
-			snprintf(buf, sizeof(buf), "Ocь X: %s%3ld.%02dмм", (x_pos < 0) ? "-" : " ", abs(x_pos/100), abs(x_pos%100));
+			snprintf(buf, sizeof(buf), "Axis X: %s%3ld.%02dmm", (x_pos < 0) ? "-" : " ", abs(x_pos/100), abs(x_pos%100));
 			writePadded(buf);
 
 			lcd.setCursor(0, 3);
-			snprintf(buf, sizeof(buf), "Ocь Z: %s%3ld.%02dмм", (z_pos < 0) ? "-" : " ", abs(z_pos/100), abs(z_pos%100));
+			snprintf(buf, sizeof(buf), "Axis Z: %s%3ld.%02dmm", (z_pos < 0) ? "-" : " ", abs(z_pos/100), abs(z_pos%100));
 			writePadded(buf);
 		}
 	}

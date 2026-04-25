@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <Arduino.h>
-#include "LiquidCrystalRus.h"
+#include <LiquidCrystal.h>
 
 // Constants from the original sketch
 #define MAX_FEED 25
@@ -29,7 +29,7 @@ typedef enum { ELS_SUB_INT = 1, ELS_SUB_MAN, ELS_SUB_EXT } els_submode_t;
 class MenuManager
 {
 public:
-	MenuManager(LiquidCrystalRus& lcd);
+	MenuManager(LiquidCrystal& lcd);
 	
 	void init();
 	void update();
@@ -44,7 +44,7 @@ public:
 	void setModeSubmode(uint8_t mode_val, uint8_t submode_val);
 
 private:
-	LiquidCrystalRus& lcd;
+	LiquidCrystal& lcd;
 
 	// Menu state
 	els_mode_t mode;
