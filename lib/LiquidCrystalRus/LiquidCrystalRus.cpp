@@ -76,6 +76,8 @@ void LiquidCrystalRus::init(uint8_t fourbitmode, uint8_t rs, uint8_t rw, uint8_t
   _rs_pin = rs;
   _rw_pin = rw;
   _enable_pin = enable;
+  utf_hi_char = 0;
+  _cyrillic_mode = LCD_CYR_A02;
   
   _data_pins[0] = d0;
   _data_pins[1] = d1;
@@ -178,6 +180,10 @@ void LiquidCrystalRus::begin(uint8_t cols, uint8_t lines, uint8_t dotsize) {
 
 void LiquidCrystalRus::setDRAMModel(uint8_t model) {
   _dram_model = model;
+}
+
+void LiquidCrystalRus::setCyrillicMode(lcd_cyrillic_mode_t mode) {
+  _cyrillic_mode = (uint8_t)mode;
 }
 
 /********** high level commands, for the user! */
@@ -296,19 +302,68 @@ inline void LiquidCrystalRus::command(uint8_t value) {
     if (ac>7 && ac<0x14) command(LCD_SETDDRAMADDR | (0x40+ac-8));
   }
 
-  if (value>=0x80) { // UTF-8 handling
-    if (value >= 0xc0) {
-      utf_hi_char = value - 0xd0;
+  if (value>=0x80) { // UTF-8 handling (only Cyrillic block is supported here)
+    // Expect 2-byte sequences: 0xD0/0xD1 + 0x80..0xBF
+    if (value == 0xD0 || value == 0xD1) {
+      utf_hi_char = value; // store the real lead byte
+    } else if ((value & 0xC0) == 0x80 && (utf_hi_char == 0xD0 || utf_hi_char == 0xD1)) {
+      uint8_t trail = value;
+      uint16_t codepoint = (utf_hi_char == 0xD0)
+        ? (0x0400u + (trail & 0x3Fu))   // U+0400..U+043F
+        : (0x0440u + (trail & 0x3Fu));  // U+0440..U+047F
+
+      // consume this UTF-8 sequence
+      utf_hi_char = 0;
+
+      if (_cyrillic_mode == LCD_CYR_TRANSLIT) {
+        // ASCII-ish fallback for A00 CGROM (no Cyrillic). Uses common look-alikes.
+        char ch = '?';
+        switch (codepoint) {
+          // Uppercase
+          case 0x0410: ch = 'A'; break; // А
+          case 0x0412: ch = 'B'; break; // В
+          case 0x0415: ch = 'E'; break; // Е
+          case 0x041A: ch = 'K'; break; // К
+          case 0x041C: ch = 'M'; break; // М
+          case 0x041D: ch = 'H'; break; // Н
+          case 0x041E: ch = 'O'; break; // О
+          case 0x0420: ch = 'P'; break; // Р
+          case 0x0421: ch = 'C'; break; // С
+          case 0x0422: ch = 'T'; break; // Т
+          case 0x0425: ch = 'X'; break; // Х
+          case 0x0423: ch = 'Y'; break; // У (looks like Y)
+          // Lowercase
+          case 0x0430: ch = 'a'; break; // а
+          case 0x0435: ch = 'e'; break; // е
+          case 0x043E: ch = 'o'; break; // о
+          case 0x0440: ch = 'p'; break; // р
+          case 0x0441: ch = 'c'; break; // с
+          case 0x0445: ch = 'x'; break; // х
+          case 0x0443: ch = 'y'; break; // у
+          default: ch = '?'; break;
+        }
+        send((uint8_t)ch, HIGH);
+      } else {
+        // A02-like Cyrillic CGROM mapping (original LiquidCrystalRus table).
+        if (codepoint == 0x0401) {            // Ё
+          send(0xa2, HIGH);                   // ╗ (as per original mapping)
+        } else if (codepoint == 0x0451) {     // ё
+          send(0xb5, HIGH);                   // ╦ (as per original mapping)
+        } else if (codepoint >= 0x0410 && codepoint <= 0x044F) {
+          uint8_t idx = (uint8_t)(codepoint - 0x0410); // 0..63
+          send(pgm_read_byte_near(utf_recode + idx), HIGH);
+        } else {
+          send((uint8_t)'?', HIGH);
+        }
+      }
     } else {
-      value &= 0x3f;
-      if (!utf_hi_char && (value == 1)) 
-        send(0xa2,HIGH); // ╗
-      else if ((utf_hi_char == 1) && (value == 0x11)) 
-        send(0xb5,HIGH); // ╦
-      else 
-        send(pgm_read_byte_near(utf_recode + value + (utf_hi_char<<6) - 0x10), HIGH);
-    }    
-  } else send(out_char, HIGH);
+      // Unsupported UTF-8 byte or broken sequence: reset state and show placeholder
+      utf_hi_char = 0;
+      send((uint8_t)'?', HIGH);
+    }
+  } else {
+    send(out_char, HIGH);
+  }
 #if defined(ARDUINO) && ARDUINO >= 100
   return 1; // assume sucess 
 #endif

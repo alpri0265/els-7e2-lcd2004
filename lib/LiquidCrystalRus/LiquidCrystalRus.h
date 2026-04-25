@@ -55,6 +55,13 @@
 
 class LiquidCrystalRus : public Print {
 public:
+  typedef enum {
+    // For LCD modules that have Cyrillic CGROM (often marketed as "Russian" / A02-like)
+    LCD_CYR_A02 = 0,
+    // For A00/Japanese CGROM modules: fall back to ASCII-ish transliteration
+    LCD_CYR_TRANSLIT = 1
+  } lcd_cyrillic_mode_t;
+
   LiquidCrystalRus(uint8_t rs, uint8_t enable,
 		uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3,
 		uint8_t d4, uint8_t d5, uint8_t d6, uint8_t d7);
@@ -101,6 +108,7 @@ public:
   void command(uint8_t);
 
   void setDRAMModel(uint8_t);
+  void setCyrillicMode(lcd_cyrillic_mode_t mode);
 
 private:
   void send(uint8_t, uint8_t);
@@ -124,6 +132,7 @@ private:
 
   uint8_t _dram_model;
   uint8_t utf_hi_char; // UTF-8 high part
+  uint8_t _cyrillic_mode;
 };
 
 #endif

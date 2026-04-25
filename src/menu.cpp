@@ -204,24 +204,24 @@ void MenuManager::render()
 
 	if (err_1)
 	{
-		lcd.setCursor(0, 0); writePadded("WARNING:");
+		lcd.setCursor(0, 0); writePadded("WARNING");
 		lcd.setCursor(0, 1); writePadded("");
-		lcd.setCursor(0, 2); writePadded("   STOPS NOT SET!   ");
+		lcd.setCursor(0, 2); writePadded("LIMIT SWITCHES N/A");
 		lcd.setCursor(0, 3); writePadded("");
 		return;
 	}
 	if (err_2)
 	{
-		lcd.setCursor(0, 0); writePadded("Set carriage to     ");
+		lcd.setCursor(0, 0); writePadded("MOVE CARRIAGE TO");
 		lcd.setCursor(0, 1); writePadded("");
-		lcd.setCursor(0, 2); writePadded("    home position!  ");
+		lcd.setCursor(0, 2); writePadded("HOME POSITION");
 		lcd.setCursor(0, 3); writePadded("");
 		return;
 	}
 	if (complete)
 	{
 		lcd.setCursor(0, 0); writePadded("");
-		lcd.setCursor(0, 1); writePadded("OPERATION COMPLETED!");
+		lcd.setCursor(0, 1); writePadded("CYCLE COMPLETE");
 		lcd.setCursor(0, 2); writePadded("");
 		lcd.setCursor(0, 3); writePadded("");
 		return;
@@ -232,25 +232,25 @@ void MenuManager::render()
 		if (select_menu == 0)
 		{
 			lcd.setCursor(0, 0);
-			lcd.print("SYNCHRONOUS ");
+			lcd.print("SYNC ");
 			
-			if (sub_feed == ELS_SUB_INT) { lcd.setCursor(11, 0); lcd.print(" Internal"); }
-			else if (sub_feed == ELS_SUB_MAN) { lcd.setCursor(11, 0); lcd.print(" Manual  "); }
-			else if (sub_feed == ELS_SUB_EXT) { lcd.setCursor(11, 0); lcd.print(" External"); }
+			if (sub_feed == ELS_SUB_INT) { lcd.setCursor(11, 0); lcd.print(" INTERNAL"); }
+			else if (sub_feed == ELS_SUB_MAN) { lcd.setCursor(11, 0); lcd.print(" MANUAL  "); }
+			else if (sub_feed == ELS_SUB_EXT) { lcd.setCursor(11, 0); lcd.print(" EXTERNAL"); }
 
 			lcd.setCursor(0, 1);
-			snprintf(buf, sizeof(buf), "Feed,  mm/rev: %d.%02d", feed_mm/100, feed_mm%100);
+			snprintf(buf, sizeof(buf), "FEED mm/rev: %d.%02d", feed_mm/100, feed_mm%100);
 			writePadded(buf);
 
 			lcd.setCursor(0, 2);
 			if (sub_feed == ELS_SUB_MAN)
-				snprintf(buf, sizeof(buf), "Passes total:     %2d", pass_total);
+				snprintf(buf, sizeof(buf), "TOTAL PASSES:   %2d", pass_total);
 			else
-				snprintf(buf, sizeof(buf), "Passes left:      %2d", pass_total - pass_nr + 1);
+				snprintf(buf, sizeof(buf), "PASSES LEFT:    %2d", pass_total - pass_nr + 1);
 			writePadded(buf);
 
 			lcd.setCursor(0, 3);
-			snprintf(buf, sizeof(buf), "Depth per pass:  %d.%01d", ap/100, ap%100);
+			snprintf(buf, sizeof(buf), "DOC/PASS:     %d.%01d", ap/100, ap%100);
 			writePadded(buf);
 		}
 		else if (select_menu == 1)
@@ -259,11 +259,11 @@ void MenuManager::render()
 			lcd.setCursor(0, 1); writePadded("");
 			
 			lcd.setCursor(0, 2);
-			snprintf(buf, sizeof(buf), "Axis X: %s%3ld.%02dmm", (x_pos < 0) ? "-" : " ", abs(x_pos/100), abs(x_pos%100));
+			snprintf(buf, sizeof(buf), "X: %s%3ld.%02d mm", (x_pos < 0) ? "-" : " ", abs(x_pos/100), abs(x_pos%100));
 			writePadded(buf);
 
 			lcd.setCursor(0, 3);
-			snprintf(buf, sizeof(buf), "Axis Z: %s%3ld.%02dmm", (z_pos < 0) ? "-" : " ", abs(z_pos/100), abs(z_pos%100));
+			snprintf(buf, sizeof(buf), "Z: %s%3ld.%02d mm", (z_pos < 0) ? "-" : " ", abs(z_pos/100), abs(z_pos%100));
 			writePadded(buf);
 		}
 	}
