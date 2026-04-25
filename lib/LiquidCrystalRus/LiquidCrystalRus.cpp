@@ -185,12 +185,14 @@ void LiquidCrystalRus::clear()
 {
   command(LCD_CLEARDISPLAY);  // clear display, set cursor position to zero
   delayMicroseconds(2000);  // this command takes a long time!
+  delay(2);
 }
 
 void LiquidCrystalRus::home()
 {
   command(LCD_RETURNHOME);  // set cursor position to zero
   delayMicroseconds(2000);  // this command takes a long time!
+  delay(2);
 }
 
 void LiquidCrystalRus::setCursor(uint8_t col, uint8_t row)
@@ -327,6 +329,7 @@ void LiquidCrystalRus::send(uint8_t value, uint8_t mode) {
     writeNbits(value,8); 
   } else {
     writeNbits(value>>4,4);
+    delayMicroseconds(100);
     writeNbits(value,4);
   }
 }
@@ -351,17 +354,18 @@ uint8_t LiquidCrystalRus::recv(uint8_t mode) {
 }
 void LiquidCrystalRus::pulseEnable() {
   digitalWrite(_enable_pin, LOW);
-  delayMicroseconds(1);    
+  delayMicroseconds(5);    
   digitalWrite(_enable_pin, HIGH);
-  delayMicroseconds(1);    // enable pulse must be >450ns
+  delayMicroseconds(50);    // enable pulse must be >450ns
   digitalWrite(_enable_pin, LOW);
-  delayMicroseconds(100);   // commands need > 37us to settle
+  delayMicroseconds(500);   // commands need > 37us to settle
 }
 
 void LiquidCrystalRus::writeNbits(uint8_t value, uint8_t n) {
   for (int i = 0; i < n; i++) {
     pinMode(_data_pins[i], OUTPUT);
     digitalWrite(_data_pins[i], (value >> i) & 0x01);
+    delayMicroseconds(50);
   }
 
   pulseEnable();
