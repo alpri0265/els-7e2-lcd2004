@@ -1,178 +1,247 @@
 #include <Arduino.h>
-#include <LiquidCrystal.h>
-#include "menu.h"
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-// Піни LCD на Port E (відповідно до main.h з оригінального проекту)
-#define LCD_RS PE7
-#define LCD_EN PE8
-#define LCD_D4 PE9
-#define LCD_D5 PE10
-#define LCD_D6 PE11
-#define LCD_D7 PE12
+// ---------------------------------------------------------------------------
+// CNC Menu (minimal) adapted to LCD2004 via I2C (PCF8574)
+// STM32F407ZE + PlatformIO/Arduino
+//
+// LCD: 20x4, address 0x27
+// I2C pins: SDA=PB7, SCL=PB6
+//
+// Buttons (existing project wiring): INPUT_PULLUP, active LOW
+// ---------------------------------------------------------------------------
 
-// Піни кнопок меню на Port B (згідно з main.h)
-#define BTN_LEFT  PB8
-#define BTN_RIGHT PB9
-#define BTN_UP    PB10
-#define BTN_DOWN  PB11
-#define BTN_SEL   PB12
+static constexpr uint8_t I2C_ADDR = 0x27;
+static constexpr uint8_t I2C_COLS = 20;
+static constexpr uint8_t I2C_ROWS = 4;
 
-// Ініціалізація дисплея
-LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+LiquidCrystal_I2C lcd(I2C_ADDR, I2C_COLS, I2C_ROWS);
 
-// Ініціалізація менеджера меню
-MenuManager menu(lcd);
+// Buttons (from earlier project)
+static constexpr uint8_t BTN_LEFT  = PB8;
+static constexpr uint8_t BTN_RIGHT = PB9;
+static constexpr uint8_t BTN_UP    = PB10;
+static constexpr uint8_t BTN_DOWN  = PB11;
+static constexpr uint8_t BTN_SEL   = PB12;
 
-static void forceLcdPulseEnable() {
-  digitalWrite(LCD_EN, LOW);
-  delayMicroseconds(250);
-  digitalWrite(LCD_EN, HIGH);
-  delayMicroseconds(2500);
-  digitalWrite(LCD_EN, LOW);
-  delayMicroseconds(25000);
+// Debounce
+static constexpr uint32_t DEBOUNCE_MS = 25;
+
+enum Key : uint8_t
+{
+  KEY_SEL = 0,
+  KEY_UP,
+  KEY_DOWN,
+  KEY_LEFT,
+  KEY_RIGHT
+};
+
+// State shown on screen
+static bool mode_sync = true;     // SYNC / MAN
+static uint16_t feed_x100 = 25;   // 0.25 mm/rev (stored as *100)
+static uint8_t pass_total = 10;   // TOTAL passes
+static uint16_t doc_x100 = 50;    // 0.50 mm (stored as *100)
+
+// Selected menu row (0..3). Marker is shown on the right edge.
+static uint8_t selected_row = 0;
+
+static char last_rows[4][21] = {{0}};
+static bool cache_valid = false;
+
+static void applySelectionMarker(uint8_t row, char s[21])
+{
+  // Cursor must be on the left side (col 0).
+  // Shift content right by 1 and put marker at [0].
+  // Keep total width at 20 chars.
+  memmove(&s[1], &s[0], 19);
+  s[0] = (row == selected_row) ? '>' : ' ';
+  s[20] = '\0';
 }
 
-static void forceLcdWrite4(uint8_t nibble) {
-  digitalWrite(LCD_D4, (nibble >> 0) & 0x01);
-  digitalWrite(LCD_D5, (nibble >> 1) & 0x01);
-  digitalWrite(LCD_D6, (nibble >> 2) & 0x01);
-  digitalWrite(LCD_D7, (nibble >> 3) & 0x01);
-  delayMicroseconds(2500);
-  forceLcdPulseEnable();
+static void makeRow0(char out[21])
+{
+  // "MODE: SYNC" or "MODE: MAN"
+  snprintf(out, 21, "MODE: %-4s", mode_sync ? "SYNC" : "MAN");
 }
 
-void forceLcdReset() {
-  // Manual HD44780 4-bit init sequence (robust for fast MCUs / 3.3V logic).
-  pinMode(LCD_RS, OUTPUT);
-  pinMode(LCD_EN, OUTPUT);
-  pinMode(LCD_D4, OUTPUT);
-  pinMode(LCD_D5, OUTPUT);
-  pinMode(LCD_D6, OUTPUT);
-  pinMode(LCD_D7, OUTPUT);
-
-  digitalWrite(LCD_RS, LOW);
-  digitalWrite(LCD_EN, LOW);
-  digitalWrite(LCD_D4, LOW);
-  digitalWrite(LCD_D5, LOW);
-  digitalWrite(LCD_D6, LOW);
-  digitalWrite(LCD_D7, LOW);
-
-  delay(60); // >40ms after power-up (and give LCD time after MCU reset)
-
-  // We start in 8-bit mode: send 0x3 (high nibble) three times
-  forceLcdWrite4(0x03);
-  delay(6);  // >4.1ms
-  forceLcdWrite4(0x03);
-  delay(6);  // >4.1ms
-  forceLcdWrite4(0x03);
-  delay(2);  // >100us
-
-  // Switch to 4-bit mode: send 0x2 (high nibble)
-  forceLcdWrite4(0x02);
-  delay(2);
+static void makeRow1(char out[21])
+{
+  // "FEED: 0.25 mm/rev"
+  snprintf(out, 21, "FEED: %u.%02u mm/rev", feed_x100 / 100, feed_x100 % 100);
 }
 
-// Функція зчитування фізичного стану кнопок
-// Повертає байт, де кожен біт відповідає за свою кнопку (1 - натиснуто, 0 - відпущено)
-uint8_t readButtons() {
-    uint8_t state = 0;
-    // Оскільки кнопки підтягнуті до VCC (INPUT_PULLUP), натискання замикає пін на GND (LOW)
-    if (digitalRead(BTN_SEL) == LOW)   state |= (1 << 0);
-    if (digitalRead(BTN_UP) == LOW)    state |= (1 << 1);
-    if (digitalRead(BTN_DOWN) == LOW)  state |= (1 << 2);
-    if (digitalRead(BTN_LEFT) == LOW)  state |= (1 << 3);
-    if (digitalRead(BTN_RIGHT) == LOW) state |= (1 << 4);
-    return state;
+static void makeRow2(char out[21])
+{
+  // "PASS: 10 TOTAL"
+  snprintf(out, 21, "PASS: %u TOTAL", pass_total);
 }
 
-// Опит кнопок з антидребезгом (debounce) та автоповтором (як було на Mega)
-void updateButtons() {
-    static uint8_t lastReading = 0;
-    static uint8_t validatedState = 0;
-    static uint32_t lastDebounceTime = 0;
-    static uint32_t lastRepeatTime = 0;
-    
-    uint8_t reading = readButtons();
-    uint32_t now = millis();
-    
-    // Якщо стан пінів змінився через брязкіт або нове натискання, скидаємо таймер
-    if (reading != lastReading) {
-        lastDebounceTime = now;
-    }
-    
-    // Якщо стан стабільний протягом 30 мс
-    if ((now - lastDebounceTime) > 30) {
-        if (reading != validatedState) {
-            // Визначаємо, які кнопки були щойно натиснуті
-            uint8_t pressed = reading & ~validatedState;
-            validatedState = reading;
-            
-            // Відправляємо події в MenuManager
-            if (pressed & (1 << 0)) menu.handleKeyEvent(0); // Select
-            if (pressed & (1 << 1)) menu.handleKeyEvent(1); // Up
-            if (pressed & (1 << 2)) menu.handleKeyEvent(2); // Down
-            if (pressed & (1 << 3)) menu.handleKeyEvent(3); // Left
-            if (pressed & (1 << 4)) menu.handleKeyEvent(4); // Right
-            
-            // Встановлюємо затримку перед початком автоповтору (400 мс)
-            lastRepeatTime = now + 400; 
-        } 
-        else if (validatedState != 0) {
-            // Якщо кнопка утримується довго, генеруємо події автоповтору (крім кнопки Select)
-            if (now > lastRepeatTime) {
-                lastRepeatTime = now + 80; // Швидкість автоповтору (кожні 80 мс)
-                
-                if (validatedState & (1 << 1)) menu.handleKeyEvent(1);
-                if (validatedState & (1 << 2)) menu.handleKeyEvent(2);
-                if (validatedState & (1 << 3)) menu.handleKeyEvent(3);
-                if (validatedState & (1 << 4)) menu.handleKeyEvent(4);
-            }
-        }
-    }
+static void makeRow3(char out[21])
+{
+  // "DOC:  0.50 mm"
+  snprintf(out, 21, "DOC:  %u.%02u mm", doc_x100 / 100, doc_x100 % 100);
+}
+
+static void padTo20(char s[21])
+{
+  const size_t n = strnlen(s, 20);
+  for (size_t i = n; i < 20; i++) s[i] = ' ';
+  s[20] = '\0';
+}
+
+static void writeRowDiff(uint8_t row, const char current[21])
+{
+  if (!cache_valid) {
+    lcd.setCursor(0, row);
+    lcd.print(current);
+    strncpy(last_rows[row], current, 21);
+    return;
+  }
+
+  // Update only changed segments
+  const char* prev = last_rows[row];
+  uint8_t col = 0;
+  while (col < 20) {
+    // Skip equal chars
+    while (col < 20 && prev[col] == current[col]) col++;
+    if (col >= 20) break;
+
+    // Find run of changed chars
+    const uint8_t start = col;
+    while (col < 20 && prev[col] != current[col]) col++;
+    const uint8_t end = col; // [start, end)
+
+    lcd.setCursor(start, row);
+    for (uint8_t i = start; i < end; i++) lcd.print(current[i]);
+  }
+
+  strncpy(last_rows[row], current, 21);
+}
+
+static void updateDisplay()
+{
+  char rows[4][21];
+
+  makeRow0(rows[0]); padTo20(rows[0]); applySelectionMarker(0, rows[0]);
+  makeRow1(rows[1]); padTo20(rows[1]); applySelectionMarker(1, rows[1]);
+  makeRow2(rows[2]); padTo20(rows[2]); applySelectionMarker(2, rows[2]);
+  makeRow3(rows[3]); padTo20(rows[3]); applySelectionMarker(3, rows[3]);
+
+  // If whole rows are unchanged, do nothing
+  if (cache_valid &&
+      strncmp(rows[0], last_rows[0], 20) == 0 &&
+      strncmp(rows[1], last_rows[1], 20) == 0 &&
+      strncmp(rows[2], last_rows[2], 20) == 0 &&
+      strncmp(rows[3], last_rows[3], 20) == 0) {
+    return;
+  }
+
+  for (uint8_t r = 0; r < 4; r++) writeRowDiff(r, rows[r]);
+  cache_valid = true;
+}
+
+static uint8_t readKeysBitmask()
+{
+  uint8_t m = 0;
+  if (digitalRead(BTN_SEL) == LOW)   m |= (1u << KEY_SEL);
+  if (digitalRead(BTN_UP) == LOW)    m |= (1u << KEY_UP);
+  if (digitalRead(BTN_DOWN) == LOW)  m |= (1u << KEY_DOWN);
+  if (digitalRead(BTN_LEFT) == LOW)  m |= (1u << KEY_LEFT);
+  if (digitalRead(BTN_RIGHT) == LOW) m |= (1u << KEY_RIGHT);
+  return m;
+}
+
+static void applyKeyPress(uint8_t key)
+{
+  switch (key) {
+    case KEY_SEL:
+      // Toggle mode only when MODE row is selected
+      if (selected_row == 0) mode_sync = !mode_sync;
+      break;
+    case KEY_UP:
+      // Move selection up
+      if (selected_row > 0) selected_row--;
+      break;
+    case KEY_DOWN:
+      // Move selection down
+      if (selected_row < 3) selected_row++;
+      break;
+    case KEY_LEFT:
+      // Decrease value of selected item
+      if (selected_row == 1) { // FEED
+        if (feed_x100 > 5) feed_x100 -= 5; // -0.05
+      } else if (selected_row == 2) { // PASS
+        if (pass_total > 1) pass_total -= 1;
+      } else if (selected_row == 3) { // DOC
+        if (doc_x100 > 5) doc_x100 -= 5;   // -0.05
+      }
+      break;
+    case KEY_RIGHT:
+      // Increase value of selected item
+      if (selected_row == 1) { // FEED
+        if (feed_x100 < 999) feed_x100 += 5; // +0.05
+      } else if (selected_row == 2) { // PASS
+        if (pass_total < 99) pass_total += 1;
+      } else if (selected_row == 3) { // DOC
+        if (doc_x100 < 999) doc_x100 += 5;   // +0.05
+      }
+      break;
+    default:
+      break;
+  }
+  updateDisplay();
+}
+
+static void updateButtonsDebounced()
+{
+  static uint8_t lastReading = 0;
+  static uint8_t stableState = 0;
+  static uint32_t lastChangeMs = 0;
+
+  const uint32_t now = millis();
+  const uint8_t reading = readKeysBitmask();
+
+  if (reading != lastReading) {
+    lastChangeMs = now;
     lastReading = reading;
+  }
+
+  if ((now - lastChangeMs) < DEBOUNCE_MS) return;
+  if (reading == stableState) return;
+
+  const uint8_t pressed = reading & ~stableState;
+  stableState = reading;
+
+  // Fire events on new presses only
+  if (pressed & (1u << KEY_SEL))   applyKeyPress(KEY_SEL);
+  if (pressed & (1u << KEY_UP))    applyKeyPress(KEY_UP);
+  if (pressed & (1u << KEY_DOWN))  applyKeyPress(KEY_DOWN);
+  if (pressed & (1u << KEY_LEFT))  applyKeyPress(KEY_LEFT);
+  if (pressed & (1u << KEY_RIGHT)) applyKeyPress(KEY_RIGHT);
 }
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("STM32F407ZE ELS Start...");
+void setup()
+{
+  // Explicit I2C pin selection before Wire.begin()
+  Wire.setSDA(PB7);
+  Wire.setSCL(PB6);
+  Wire.begin();
+  Wire.setClock(400000);
 
-  // Налаштування пінів кнопок як входи з підтягувальним резистором (INPUT_PULLUP)
+  lcd.init();
+  lcd.backlight();
+
   pinMode(BTN_LEFT, INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_SEL, INPUT_PULLUP);
 
-  forceLcdReset();
-
-  // Ініціалізація LCD та меню
-  menu.init();
-  lcd.noCursor();
-  lcd.noBlink();
-  
-  // Виводимо початковий екран
-  menu.render();
-
-  Serial.println("Menu initialized. Hardware buttons active.");
+  updateDisplay(); // initial paint
 }
 
-void loop() {
-  // Виклик оновлення внутрішньої логіки меню
-  menu.update();
-
-  // Опит апаратних кнопок
-  updateButtons();
-
-  // Тестове перемикання екранів меню через Serial (для зручності відлагодження)
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c == 's') menu.handleKeyEvent(0); // Select
-    if (c == 'u') menu.handleKeyEvent(1); // Up
-    if (c == 'd') menu.handleKeyEvent(2); // Down
-    if (c == 'l') menu.handleKeyEvent(3); // Left
-    if (c == 'r') menu.handleKeyEvent(4); // Right
-  }
-
-  // Невелика затримка для стабільності
-  delay(1);
+void loop()
+{
+  updateButtonsDebounced();
 }
