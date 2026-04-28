@@ -13,3 +13,8 @@ Desktop.ini
 *~
 .vscode/
 .idea/
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/

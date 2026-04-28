@@ -75,6 +75,7 @@ static SubMode submode_per_mode[MODE_COUNT] = {
 
 static uint16_t feed_x100 = 25;   // 0.25 mm/rev (stored as *100)
 static uint8_t pass_total = 10;   // TOTAL passes
+static uint8_t pass_cur = 1;      // Current pass number (1..pass_total)
 static uint16_t doc_x100 = 50;    // 0.50 mm (stored as *100)
 
 // Selected menu row (0..3). Marker is shown on the right edge.
@@ -220,8 +221,8 @@ static void makeRow1(char out[21])
 
 static void makeRow2(char out[21])
 {
-  // Shared concept: total passes/steps counter
-  snprintf(out, 21, "PASS: %u TOTAL", pass_total);
+  // Show current/total passes
+  snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
 }
 
 static void makeRow3(char out[21])
@@ -244,7 +245,7 @@ static void makeSubmenuRow1(char out[21])
 
 static void makeSubmenuRow2(char out[21])
 {
-  snprintf(out, 21, "PASS: %u TOTAL", pass_total);
+  snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
 }
 
 static void makeSubmenuRow3(char out[21])
@@ -358,12 +359,13 @@ static void applyKeyPress(uint8_t key)
           if (feed_x100 > 5) feed_x100 -= 5;
         } else if (selected_row == 2) {
           if (pass_total > 1) pass_total -= 1;
+          if (pass_cur > pass_total) pass_cur = pass_total;
         } else if (selected_row == 3) {
           if (doc_x100 > 5) doc_x100 -= 5;
         }
       } else {
         // Submenu: adjust selected value only
-        if (selected_row == 2 && pass_total > 1) pass_total -= 1;
+        if (selected_row == 2 && pass_total > 1) { pass_total -= 1; if (pass_cur > pass_total) pass_cur = pass_total; }
         if (selected_row == 3 && doc_x100 > 5) doc_x100 -= 5;
       }
       break;
