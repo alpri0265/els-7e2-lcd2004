@@ -29,6 +29,18 @@ static constexpr uint8_t BTN_UP    = PB10;
 static constexpr uint8_t BTN_DOWN  = PB11;
 static constexpr uint8_t BTN_SEL   = PB12;
 
+// Joystick (CubeMX wiring): active LOW with pull-ups
+static constexpr uint8_t JOY_L_PIN = PF12;
+static constexpr uint8_t JOY_R_PIN = PF13;
+static constexpr uint8_t JOY_U_PIN = PF14;
+static constexpr uint8_t JOY_D_PIN = PF15;
+
+// Rapid button (CubeMX wiring): active LOW with pull-up
+static constexpr uint8_t BTN_RAPID_PIN = PD7;
+
+// Feed potentiometer (CubeMX wiring): ADC on PF6
+static constexpr uint8_t ADC_FEED_PIN = PF6;
+
 // Debounce
 static constexpr uint32_t DEBOUNCE_MS = 25;
 static constexpr uint32_t LONGPRESS_MS = 650;
@@ -77,6 +89,12 @@ static uint16_t feed_x100 = 25;   // 0.25 mm/rev (stored as *100)
 static uint8_t pass_total = 10;   // TOTAL passes
 static uint8_t pass_cur = 1;      // Current pass number (1..pass_total)
 static uint16_t doc_x100 = 50;    // 0.50 mm (stored as *100)
+static bool rapid_enabled = false;
+
+// ADC smoothing for potentiometer
+static uint16_t adc_ring[16] = {0};
+static uint8_t adc_ring_idx = 0;
+static uint32_t adc_sum = 0;
 
 // Selected menu row (0..3). Marker is shown on the right edge.
 static uint8_t selected_row = 0;
@@ -186,7 +204,8 @@ static void applySelectionMarker(uint8_t row, char s[21])
 static void makeRow0(char out[21])
 {
   // "MODE: FEED SYNC"
-  snprintf(out, 21, "MODE:%-7s %-4s", modeName(current_mode), subModeName(submode_per_mode[current_mode]));
+  // Show RAPID flag in the last 2 chars (keeps layout stable)
+  snprintf(out, 21, "MODE:%-7s %-3s %c", modeName(current_mode), subModeName(submode_per_mode[current_mode]), rapid_enabled ? 'R' : ' ');
 }
 
 static void makeRow1(char out[21])
@@ -326,6 +345,12 @@ static uint8_t readKeysBitmask()
   if (digitalRead(BTN_DOWN) == LOW)  m |= (1u << KEY_DOWN);
   if (digitalRead(BTN_LEFT) == LOW)  m |= (1u << KEY_LEFT);
   if (digitalRead(BTN_RIGHT) == LOW) m |= (1u << KEY_RIGHT);
+
+  // Joystick maps to same directions (active LOW)
+  if (digitalRead(JOY_U_PIN) == LOW) m |= (1u << KEY_UP);
+  if (digitalRead(JOY_D_PIN) == LOW) m |= (1u << KEY_DOWN);
+  if (digitalRead(JOY_L_PIN) == LOW) m |= (1u << KEY_LEFT);
+  if (digitalRead(JOY_R_PIN) == LOW) m |= (1u << KEY_RIGHT);
   return m;
 }
 
@@ -438,6 +463,66 @@ static void updateButtonsDebounced()
   if (pressed & (1u << KEY_RIGHT)) applyKeyPress(KEY_RIGHT);
 }
 
+static void updateRapidButton()
+{
+  static uint8_t last = HIGH;
+  static uint32_t lastChangeMs = 0;
+  const uint32_t now = millis();
+  const uint8_t cur = digitalRead(BTN_RAPID_PIN);
+
+  if (cur != last) {
+    last = cur;
+    lastChangeMs = now;
+  }
+  if ((now - lastChangeMs) < DEBOUNCE_MS) return;
+
+  // active LOW: toggle on press edge
+  static bool prevStableHigh = true;
+  const bool stablePressed = (cur == LOW);
+  if (stablePressed && prevStableHigh) {
+    rapid_enabled = !rapid_enabled;
+    cache_valid = false;
+    updateDisplay();
+  }
+  prevStableHigh = !stablePressed;
+}
+
+static uint16_t mapAdcToFeedX100(uint16_t adc12)
+{
+  // Map 0..4095 to 0.05..9.99 (x100 => 5..999)
+  const uint16_t minv = 5;
+  const uint16_t maxv = 999;
+  return (uint16_t)(minv + (uint32_t)(maxv - minv) * adc12 / 4095U);
+}
+
+static void updateFeedFromPot()
+{
+  // Read ADC, smooth, then update feed_x100 when change is meaningful
+  const uint16_t raw = analogRead(ADC_FEED_PIN); // STM32 core typically returns 0..4095
+
+  // init ring on first call
+  static bool adc_inited = false;
+  if (!adc_inited) {
+    adc_sum = 0;
+    for (uint8_t i = 0; i < 16; i++) { adc_ring[i] = raw; adc_sum += raw; }
+    adc_ring_idx = 0;
+    adc_inited = true;
+  }
+
+  adc_sum -= adc_ring[adc_ring_idx];
+  adc_ring[adc_ring_idx] = raw;
+  adc_sum += raw;
+  adc_ring_idx = (uint8_t)((adc_ring_idx + 1) & 0x0F);
+
+  const uint16_t avg = (uint16_t)(adc_sum / 16U);
+  const uint16_t new_feed = mapAdcToFeedX100(avg);
+
+  if (new_feed != feed_x100) {
+    feed_x100 = new_feed;
+    updateDisplay();
+  }
+}
+
 static void updateModeSubmodeFromSwitches()
 {
   // Debounce mode + submode switches as one combined state
@@ -541,6 +626,16 @@ void setup()
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_SEL, INPUT_PULLUP);
 
+  // Joystick + RAPID button
+  pinMode(JOY_L_PIN, INPUT_PULLUP);
+  pinMode(JOY_R_PIN, INPUT_PULLUP);
+  pinMode(JOY_U_PIN, INPUT_PULLUP);
+  pinMode(JOY_D_PIN, INPUT_PULLUP);
+  pinMode(BTN_RAPID_PIN, INPUT_PULLUP);
+
+  // ADC feed potentiometer
+  pinMode(ADC_FEED_PIN, INPUT_ANALOG);
+
   // Mode/submode switches (use pullups to avoid floating)
   for (uint8_t i = 0; i < 8; i++) pinMode(MODE_PINS[i], INPUT_PULLUP);
   for (uint8_t i = 0; i < 3; i++) pinMode(SUBMODE_PINS[i], INPUT_PULLUP);
@@ -552,5 +647,7 @@ void setup()
 void loop()
 {
   updateModeSubmodeFromSwitches();
+  updateRapidButton();
+  updateFeedFromPot();
   updateButtonsDebounced();
 }
