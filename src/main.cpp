@@ -89,7 +89,11 @@ static uint16_t feed_x100 = 25;   // 0.25 mm/rev (stored as *100)
 static uint8_t pass_total = 10;   // TOTAL passes
 static uint8_t pass_cur = 1;      // Current pass number (1..pass_total)
 static uint16_t doc_x100 = 50;    // 0.50 mm (stored as *100)
-static bool rapid_enabled = false;
+static bool rapid_enabled = false; // "RAPID active now" (momentary like in main)
+
+// Joystick "manual move" flags (ported from main semantics)
+static bool joy_z_active = false;
+static bool joy_x_active = false;
 
 // ADC smoothing for potentiometer
 static uint16_t adc_ring[16] = {0};
@@ -204,8 +208,14 @@ static void applySelectionMarker(uint8_t row, char s[21])
 static void makeRow0(char out[21])
 {
   // "MODE: FEED SYNC"
-  // Show RAPID flag in the last 2 chars (keeps layout stable)
-  snprintf(out, 21, "MODE:%-7s %-3s %c", modeName(current_mode), subModeName(submode_per_mode[current_mode]), rapid_enabled ? 'R' : ' ');
+  // Show RAPID + manual-axis flags in the last columns (keeps layout stable)
+  // Layout: "MODE:xxxxxxx yyy <axis><R>"
+  const char axis = joy_z_active ? 'Z' : (joy_x_active ? 'X' : ' ');
+  snprintf(out, 21, "MODE:%-7s %-3s %c%c",
+           modeName(current_mode),
+           subModeName(submode_per_mode[current_mode]),
+           axis,
+           rapid_enabled ? 'R' : ' ');
 }
 
 static void makeRow1(char out[21])
@@ -347,11 +357,97 @@ static uint8_t readKeysBitmask()
   if (digitalRead(BTN_RIGHT) == LOW) m |= (1u << KEY_RIGHT);
 
   // Joystick maps to same directions (active LOW)
+  // NOTE: we still read joystick here, but "main-style joystick logic"
+  // is handled separately in updateJoystickMainStyle().
   if (digitalRead(JOY_U_PIN) == LOW) m |= (1u << KEY_UP);
   if (digitalRead(JOY_D_PIN) == LOW) m |= (1u << KEY_DOWN);
   if (digitalRead(JOY_L_PIN) == LOW) m |= (1u << KEY_LEFT);
   if (digitalRead(JOY_R_PIN) == LOW) m |= (1u << KEY_RIGHT);
   return m;
+}
+
+// ---------------------------------------------------------------------------
+// Joystick logic (ported from main):
+// - Active LOW with pull-ups.
+// - Directions map to axis activity:
+//   LEFT/RIGHT => Z axis active
+//   UP/DOWN    => X axis active
+// - Neutral clears both axis flags.
+// - While joystick axis active, mode/submode switches are ignored.
+// ---------------------------------------------------------------------------
+enum class JoyDir : uint8_t { None, Left, Right, Up, Down };
+
+static JoyDir readJoystickDir()
+{
+  // Equivalent to main's "one line low" scheme.
+  // If multiple are pressed, deterministic priority is used.
+  const bool l = (digitalRead(JOY_L_PIN) == LOW);
+  const bool r = (digitalRead(JOY_R_PIN) == LOW);
+  const bool u = (digitalRead(JOY_U_PIN) == LOW);
+  const bool d = (digitalRead(JOY_D_PIN) == LOW);
+
+  if (l) return JoyDir::Left;
+  if (r) return JoyDir::Right;
+  if (u) return JoyDir::Up;
+  if (d) return JoyDir::Down;
+  return JoyDir::None;
+}
+
+static void joyNoPressed()
+{
+  if (!joy_z_active && !joy_x_active) return;
+  joy_z_active = false;
+  joy_x_active = false;
+  cache_valid = false;
+  updateDisplay();
+}
+
+static void joyLeftPressed()
+{
+  joy_x_active = false;
+  joy_z_active = true;
+  cache_valid = false;
+  updateDisplay();
+}
+
+static void joyRightPressed()
+{
+  joy_x_active = false;
+  joy_z_active = true;
+  cache_valid = false;
+  updateDisplay();
+}
+
+static void joyUpPressed()
+{
+  joy_z_active = false;
+  joy_x_active = true;
+  cache_valid = false;
+  updateDisplay();
+}
+
+static void joyDownPressed()
+{
+  joy_z_active = false;
+  joy_x_active = true;
+  cache_valid = false;
+  updateDisplay();
+}
+
+static void updateJoystickMainStyle()
+{
+  static JoyDir last = JoyDir::None;
+  const JoyDir cur = readJoystickDir();
+  if (cur == last) return;
+  last = cur;
+
+  switch (cur) {
+    case JoyDir::Left:  joyLeftPressed();  break;
+    case JoyDir::Right: joyRightPressed(); break;
+    case JoyDir::Up:    joyUpPressed();    break;
+    case JoyDir::Down:  joyDownPressed();  break;
+    case JoyDir::None:  joyNoPressed();    break;
+  }
 }
 
 static void applyKeyPress(uint8_t key)
@@ -465,10 +561,11 @@ static void updateButtonsDebounced()
 
 static void updateRapidButton()
 {
+  // Ported from main semantics: RAPID is a modifier while button is held.
   static uint8_t last = HIGH;
   static uint32_t lastChangeMs = 0;
   const uint32_t now = millis();
-  const uint8_t cur = digitalRead(BTN_RAPID_PIN);
+  const uint8_t cur = digitalRead(BTN_RAPID_PIN); // active LOW
 
   if (cur != last) {
     last = cur;
@@ -476,15 +573,12 @@ static void updateRapidButton()
   }
   if ((now - lastChangeMs) < DEBOUNCE_MS) return;
 
-  // active LOW: toggle on press edge
-  static bool prevStableHigh = true;
-  const bool stablePressed = (cur == LOW);
-  if (stablePressed && prevStableHigh) {
-    rapid_enabled = !rapid_enabled;
+  const bool newRapid = (cur == LOW);
+  if (newRapid != rapid_enabled) {
+    rapid_enabled = newRapid;
     cache_valid = false;
     updateDisplay();
   }
-  prevStableHigh = !stablePressed;
 }
 
 static uint16_t mapAdcToFeedX100(uint16_t adc12)
@@ -525,6 +619,9 @@ static void updateFeedFromPot()
 
 static void updateModeSubmodeFromSwitches()
 {
+  // main behavior: ignore mode/submode switching while joystick is driving an axis
+  if (joy_z_active || joy_x_active) return;
+
   // Debounce mode + submode switches as one combined state
   static uint8_t lastModeByte = 0xFF;
   static uint8_t lastSubBits = 0xFF;
@@ -646,6 +743,7 @@ void setup()
 
 void loop()
 {
+  updateJoystickMainStyle();
   updateModeSubmodeFromSwitches();
   updateRapidButton();
   updateFeedFromPot();
