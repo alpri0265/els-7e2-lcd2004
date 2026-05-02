@@ -2,6 +2,12 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
+#if defined(STM32F407xx)
+#include "stm32f4xx_ll_bus.h"
+#include "stm32f4xx_ll_gpio.h"
+#include "stm32f4xx_ll_tim.h"
+#endif
+
 // ---------------------------------------------------------------------------
 // CNC Menu (minimal) adapted to LCD2004 via I2C (PCF8574)
 // STM32F407ZE + PlatformIO/Arduino
@@ -38,12 +44,64 @@ static constexpr uint8_t JOY_D_PIN = PF15;
 // Rapid button (CubeMX wiring): active LOW with pull-up
 static constexpr uint8_t BTN_RAPID_PIN = PD7;
 
+// Optional: STOP / motion inhibit (CubeMX label `BTN_STOP` = PB13), active LOW.
+// Leave disabled unless your panel actually wires this pin as a normally-open switch to GND.
+// If enabled while the pin is accidentally held LOW, motion will never start.
+#define ENABLE_HW_MOTION_STOP 0
+#if ENABLE_HW_MOTION_STOP
+static constexpr uint8_t BTN_STOP_PIN = PB13;
+#endif
+
 // Feed potentiometer (CubeMX wiring): ADC on PF6
 static constexpr uint8_t ADC_FEED_PIN = PF6;
+
+static constexpr uint8_t BEEPER_PIN = PD0;
+
+// Hand wheel: TIM4 quadrature on PD12 (CH1) + PD13 (CH2). After handEncoderHwInit() do not pinMode these.
+static constexpr uint8_t ENC_HC_A_PIN = PD12;
+static constexpr uint8_t ENC_HC_B_PIN = PD13;
+static constexpr uint8_t AXIS_Z_PIN   = PD11;
+static constexpr uint8_t AXIS_X_PIN   = PD15;
+static constexpr uint8_t SCALE_X100_PIN = PD4;
+static constexpr uint8_t SCALE_X1_PIN   = PD5;
+static constexpr uint8_t SCALE_X10_PIN  = PD6;
+
+// If X moves opposite to Z for the same encoder rotation, set to 1.
+static constexpr bool HAND_ENCODER_INVERT_X = false;
+
+// Stepper driver outputs (CubeMX wiring)
+static constexpr uint8_t Z_STEP_PIN = PC0;
+static constexpr uint8_t Z_DIR_PIN  = PC1;
+static constexpr uint8_t Z_EN_PIN   = PC2;
+static constexpr uint8_t X_STEP_PIN = PC3;
+static constexpr uint8_t X_DIR_PIN  = PC4;
+static constexpr uint8_t X_EN_PIN   = PC5;
+
+// Driver polarity (for DM556D via 74HCT245 -> DM556D PUL-/DIR-/ENA- with PUL+/DIR+/ENA+ tied to +5V)
+// In that wiring, sinking current (LOW) typically activates the opto input => ACTIVE_LOW=true.
+static constexpr bool STEP_ACTIVE_LOW = true;
+static constexpr bool DIR_ACTIVE_LOW  = true;
+static constexpr bool EN_ACTIVE_LOW   = true;
+
+// DM556 "ENA" polarity/wiring is the #1 footgun: if firmware drives ENA incorrectly,
+// the driver can remain disabled forever -> joystick UI moves but motors don't.
+//
+// Default: do NOT toggle EN from MCU during jog. Idle level keeps the ENA opto *inactive* (GPIO HIGH
+// with EN_ACTIVE_LOW), matching boards that default-enable when ENA is not sunk — same as leaving ENA unwired.
+//
+// Set to 1 only if you are sure your ENA wiring matches EN_ACTIVE_LOW semantics.
+#define STEPPER_DRIVE_ENABLE_PIN 0
 
 // Debounce
 static constexpr uint32_t DEBOUNCE_MS = 25;
 static constexpr uint32_t LONGPRESS_MS = 650;
+static constexpr uint32_t KEY_REPEAT_DELAY_MS = 450;
+static constexpr uint32_t KEY_REPEAT_RATE_MS = 120;
+static constexpr uint16_t BEEP_MS = 25;
+
+// Joystick debounce for motion (prevents "stuck direction" from a single noisy edge)
+static constexpr uint32_t JOY_DEBOUNCE_MS = 5;
+static constexpr uint8_t JOY_STABLE_SAMPLES = 2;
 
 enum Key : uint8_t
 {
@@ -99,6 +157,7 @@ static bool joy_x_active = false;
 static uint16_t adc_ring[16] = {0};
 static uint8_t adc_ring_idx = 0;
 static uint32_t adc_sum = 0;
+static bool pot_locked = false;
 
 // Selected menu row (0..3). Marker is shown on the right edge.
 static uint8_t selected_row = 0;
@@ -110,6 +169,15 @@ static bool cache_valid = false;
 // Raw switch/key state (kept for internal decode/robustness)
 static uint8_t last_pd8_10 = 0x07; // bits: 0=PD8,1=PD9,2=PD10 (1=HIGH)
 static uint8_t last_keys_reading = 0;
+
+static bool beeper_on = false;
+static uint32_t beeper_until_ms = 0;
+
+// Hand wheel: live values for LCD (TIM4 counter + axis/scale switches)
+enum class HandAxisSel : uint8_t { None, Z, X };
+static HandAxisSel g_hand_axis_disp = HandAxisSel::None;
+static int16_t g_hand_cnt_disp = 0;
+static uint16_t g_hand_scale_mult_disp = 1;
 
 static const char* modeName(Mode m)
 {
@@ -256,10 +324,15 @@ static void makeRow2(char out[21])
 
 static void makeRow3(char out[21])
 {
-  // "DOC:  0.50 mm"
-  snprintf(out, 21, "DOC:  %u.%02u mm",
+  char axc = '.';
+  if (g_hand_axis_disp == HandAxisSel::Z) axc = 'Z';
+  else if (g_hand_axis_disp == HandAxisSel::X) axc = 'X';
+  snprintf(out, 21, "DOC%u.%02u %c%3u %5d",
            (unsigned)(doc_x100 / 100),
-           (unsigned)(doc_x100 % 100));
+           (unsigned)(doc_x100 % 100),
+           axc,
+           (unsigned)g_hand_scale_mult_disp,
+           (int)g_hand_cnt_disp);
 }
 
 static void makeSubmenuRow0(char out[21])
@@ -356,13 +429,9 @@ static uint8_t readKeysBitmask()
   if (digitalRead(BTN_LEFT) == LOW)  m |= (1u << KEY_LEFT);
   if (digitalRead(BTN_RIGHT) == LOW) m |= (1u << KEY_RIGHT);
 
-  // Joystick maps to same directions (active LOW)
-  // NOTE: we still read joystick here, but "main-style joystick logic"
-  // is handled separately in updateJoystickMainStyle().
-  if (digitalRead(JOY_U_PIN) == LOW) m |= (1u << KEY_UP);
-  if (digitalRead(JOY_D_PIN) == LOW) m |= (1u << KEY_DOWN);
-  if (digitalRead(JOY_L_PIN) == LOW) m |= (1u << KEY_LEFT);
-  if (digitalRead(JOY_R_PIN) == LOW) m |= (1u << KEY_RIGHT);
+  // Joystick is intentionally NOT mapped to menu keys here.
+  // Otherwise moving the joystick would move the on-screen menu cursor (KEY_UP/DOWN/LEFT/RIGHT).
+  // Axis jogging uses PF12..PF15 via debouncedJoystickDir() / updateStepperJog().
   return m;
 }
 
@@ -376,6 +445,8 @@ static uint8_t readKeysBitmask()
 // - While joystick axis active, mode/submode switches are ignored.
 // ---------------------------------------------------------------------------
 enum class JoyDir : uint8_t { None, Left, Right, Up, Down };
+
+static JoyDir joy_dir = JoyDir::None;
 
 static JoyDir readJoystickDir()
 {
@@ -391,6 +462,33 @@ static JoyDir readJoystickDir()
   if (u) return JoyDir::Up;
   if (d) return JoyDir::Down;
   return JoyDir::None;
+}
+
+static JoyDir debouncedJoystickDir()
+{
+  static JoyDir stable = JoyDir::None;
+  static JoyDir candidate = JoyDir::None;
+  static uint8_t stableCount = 0;
+  static uint32_t lastChangeMs = 0;
+
+  const uint32_t now = millis();
+  const JoyDir raw = readJoystickDir();
+
+  if (raw != candidate) {
+    candidate = raw;
+    stableCount = 1;
+    lastChangeMs = now;
+    return stable;
+  }
+
+  // same as candidate
+  if ((now - lastChangeMs) < JOY_DEBOUNCE_MS) return stable;
+  if (stableCount < 255) stableCount++;
+
+  if (stableCount >= JOY_STABLE_SAMPLES && stable != candidate) {
+    stable = candidate;
+  }
+  return stable;
 }
 
 static void joyNoPressed()
@@ -437,7 +535,7 @@ static void joyDownPressed()
 static void updateJoystickMainStyle()
 {
   static JoyDir last = JoyDir::None;
-  const JoyDir cur = readJoystickDir();
+  const JoyDir cur = debouncedJoystickDir();
   if (cur == last) return;
   last = cur;
 
@@ -450,34 +548,448 @@ static void updateJoystickMainStyle()
   }
 }
 
-static void applyKeyPress(uint8_t key)
+// ---------------------------------------------------------------------------
+// Stepper pulse generator (jog)
+// - Non-blocking, driven from loop() via micros().
+// - Generates STEP pulses while joystick is held.
+// - SPEED is derived from feed_x100 and RAPID modifier.
+// ---------------------------------------------------------------------------
+struct StepperJog
+{
+  uint8_t stepPin;
+  uint8_t dirPin;
+  uint8_t enPin;
+
+  bool enabled = false;
+  bool dir = false;
+
+  bool stepIsActive = false;
+  uint32_t stepOffAtUs = 0;
+  uint32_t nextStepAtUs = 0;
+  bool dirSetupPending = false;
+  uint32_t dirSetupUntilUs = 0;
+};
+
+static StepperJog jogZ {Z_STEP_PIN, Z_DIR_PIN, Z_EN_PIN};
+static StepperJog jogX {X_STEP_PIN, X_DIR_PIN, X_EN_PIN};
+
+static inline void writePolarityPin(uint8_t pin, bool logicalHigh, bool activeLow)
+{
+  digitalWrite(pin, (logicalHigh ^ activeLow) ? HIGH : LOW);
+}
+
+static void stepperInitPins()
+{
+  pinMode(Z_STEP_PIN, OUTPUT);
+  pinMode(Z_DIR_PIN, OUTPUT);
+  pinMode(X_STEP_PIN, OUTPUT);
+  pinMode(X_DIR_PIN, OUTPUT);
+  pinMode(Z_EN_PIN, OUTPUT);
+  pinMode(X_EN_PIN, OUTPUT);
+
+  // Default: STEP/DIR inactive.
+  // EN pins stay driven as outputs so the 74HCT245 input isn't floating.
+  //
+  // Many DM556 boards default to "motor enabled" when the ENA opto is *off* (no sink on ENA-).
+  // Holding ENA- active (LOW through the buffer) can latch fault / stay disabled on some units —
+  // same symptom as "disconnect ENA from MCU and it runs".
+  //
+  // - STEPPER_DRIVE_ENABLE_PIN=0: hold EN *inactive* (release opto) so the driver behaves like
+  //   unconnected ENA logic — not the same as "logical enable=true" on the GPIO.
+  // - STEPPER_DRIVE_ENABLE_PIN=1: same idle level at boot; jogSetEnabled() toggles EN during motion.
+  writePolarityPin(Z_EN_PIN, false, EN_ACTIVE_LOW);
+  writePolarityPin(X_EN_PIN, false, EN_ACTIVE_LOW);
+  writePolarityPin(Z_STEP_PIN, false, STEP_ACTIVE_LOW);
+  writePolarityPin(X_STEP_PIN, false, STEP_ACTIVE_LOW);
+}
+
+static uint32_t feedToStepsPerSecond(uint16_t fx100, bool rapid)
+{
+  // Simple mapping for manual jog:
+  // fx100 (5..999) -> base speed (80..2500 steps/s)
+  const uint32_t minSps = 80;
+  const uint32_t maxSps = 2500;
+  const uint32_t sps = minSps + (uint32_t)(maxSps - minSps) * (uint32_t)fx100 / 999U;
+  return rapid ? (sps * 3U) : sps;
+}
+
+static void jogSetEnabled(StepperJog& j, bool en)
+{
+  if (j.enabled == en) return;
+  const bool was = j.enabled;
+  j.enabled = en;
+#if STEPPER_DRIVE_ENABLE_PIN
+  writePolarityPin(j.enPin, en, EN_ACTIVE_LOW);
+#endif
+  if (!en) {
+    j.stepIsActive = false;
+    writePolarityPin(j.stepPin, false, STEP_ACTIVE_LOW);
+  } else if (!was) {
+    // Fresh start: don't inherit stale scheduling from a previous jog session.
+    j.stepIsActive = false;
+    j.nextStepAtUs = micros();
+    j.dirSetupPending = false;
+    j.dirSetupUntilUs = 0;
+  }
+}
+
+static void jogSetDir(StepperJog& j, bool dirLogical)
+{
+  if (j.dir == dirLogical) return;
+  j.dir = dirLogical;
+  writePolarityPin(j.dirPin, dirLogical, DIR_ACTIVE_LOW);
+}
+
+static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t stepIntervalUs)
+{
+  const uint32_t now = micros();
+
+  if (!wantMove || stepIntervalUs == 0) {
+    jogSetEnabled(j, false);
+    return;
+  }
+
+  jogSetEnabled(j, true);
+  const bool dirChanged = (j.dir != dirLogical);
+  jogSetDir(j, dirLogical);
+  if (dirChanged) {
+    // DM556 family typically wants >=5us DIR setup before a PUL active edge.
+    static constexpr uint32_t DIR_SETUP_US = 6;
+    j.dirSetupPending = true;
+    j.dirSetupUntilUs = now + DIR_SETUP_US;
+    // Also restart step scheduling after a DIR change.
+    j.stepIsActive = false;
+    j.nextStepAtUs = now;
+  }
+
+  // STEP pulse width (active) for opto inputs: keep >= 5us.
+  static constexpr uint32_t PULSE_US = 6;
+
+  // Turn STEP off when pulse time elapses
+  if (j.stepIsActive && (int32_t)(now - j.stepOffAtUs) >= 0) {
+    j.stepIsActive = false;
+    writePolarityPin(j.stepPin, false, STEP_ACTIVE_LOW);
+  }
+
+  // Schedule new step
+  if (!j.stepIsActive && (int32_t)(now - j.nextStepAtUs) >= 0) {
+    // Important: do not `return` early from this function — we must always finish
+    // the STEP "off" phase above; otherwise the line can get stuck active and
+    // no further pulses will be generated.
+    if (!j.dirSetupPending || (int32_t)(now - j.dirSetupUntilUs) >= 0) {
+      if (j.dirSetupPending) j.dirSetupPending = false;
+      j.stepIsActive = true;
+      writePolarityPin(j.stepPin, true, STEP_ACTIVE_LOW);
+      j.stepOffAtUs = now + PULSE_US;
+      j.nextStepAtUs = now + stepIntervalUs;
+    }
+  }
+}
+
+static bool motionInhibited()
+{
+#if !ENABLE_HW_MOTION_STOP
+  return false;
+#else
+  static uint8_t last = HIGH;
+  static uint32_t lastChangeMs = 0;
+
+  const uint32_t now = millis();
+  const uint8_t cur = digitalRead(BTN_STOP_PIN); // active LOW
+
+  if (cur != last) {
+    last = cur;
+    lastChangeMs = now;
+  }
+  if ((now - lastChangeMs) < DEBOUNCE_MS) {
+    return digitalRead(BTN_STOP_PIN) == LOW;
+  }
+
+  return cur == LOW;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Hand encoder (TIM4 quadrature on PD12/PD13) + axis / scale switches
+// Joystick has priority: hand wheel is ignored while the joystick is off-center.
+// ---------------------------------------------------------------------------
+#if defined(STM32F407xx)
+static uint16_t s_hand_enc_last = 0;
+
+static void handEncoderHwInit()
+{
+  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM4);
+  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOD);
+
+  // LL needs GPIO pin bit masks, not Arduino pin numbers.
+  LL_GPIO_SetPinMode(GPIOD, LL_GPIO_PIN_12 | LL_GPIO_PIN_13, LL_GPIO_MODE_ALTERNATE);
+  LL_GPIO_SetAFPin_8_15(GPIOD, LL_GPIO_PIN_12, LL_GPIO_AF_2);
+  LL_GPIO_SetAFPin_8_15(GPIOD, LL_GPIO_PIN_13, LL_GPIO_AF_2);
+  LL_GPIO_SetPinSpeed(GPIOD, LL_GPIO_PIN_12 | LL_GPIO_PIN_13, LL_GPIO_SPEED_FREQ_HIGH);
+  LL_GPIO_SetPinPull(GPIOD, LL_GPIO_PIN_12 | LL_GPIO_PIN_13, LL_GPIO_PULL_UP);
+
+  LL_TIM_InitTypeDef tim = {};
+  tim.Prescaler = 0;
+  tim.CounterMode = LL_TIM_COUNTERMODE_UP;
+  tim.Autoreload = 0xFFFF;
+  tim.ClockDivision = LL_TIM_CLOCKDIVISION_DIV1;
+  LL_TIM_Init(TIM4, &tim);
+
+  LL_TIM_ENCODER_InitTypeDef enc = {};
+  enc.EncoderMode = LL_TIM_ENCODERMODE_X4_TI12;
+  enc.IC1Polarity = LL_TIM_IC_POLARITY_RISING;
+  enc.IC1ActiveInput = LL_TIM_ACTIVEINPUT_DIRECTTI;
+  enc.IC1Prescaler = LL_TIM_ICPSC_DIV1;
+  enc.IC1Filter = 0x6;
+  enc.IC2Polarity = LL_TIM_IC_POLARITY_RISING;
+  enc.IC2ActiveInput = LL_TIM_ACTIVEINPUT_DIRECTTI;
+  enc.IC2Prescaler = LL_TIM_ICPSC_DIV1;
+  enc.IC2Filter = 0x6;
+  LL_TIM_ENCODER_Init(TIM4, &enc);
+
+  LL_TIM_SetCounter(TIM4, 0);
+  LL_TIM_EnableCounter(TIM4);
+  s_hand_enc_last = 0;
+}
+
+static int16_t handEncoderReadDelta()
+{
+  const uint16_t c = LL_TIM_GetCounter(TIM4);
+  const int16_t d = (int16_t)(c - s_hand_enc_last);
+  s_hand_enc_last = c;
+  return d;
+}
+#else
+static void handEncoderHwInit() {}
+static int16_t handEncoderReadDelta() { return 0; }
+#endif
+
+static HandAxisSel readHandAxisDebounced()
+{
+  static HandAxisSel stable = HandAxisSel::None;
+  static HandAxisSel candidate = HandAxisSel::None;
+  static uint32_t tStable = 0;
+
+  HandAxisSel raw = HandAxisSel::None;
+  const bool z = (digitalRead(AXIS_Z_PIN) == LOW);
+  const bool x = (digitalRead(AXIS_X_PIN) == LOW);
+  if (z && !x) raw = HandAxisSel::Z;
+  else if (x && !z) raw = HandAxisSel::X;
+
+  const uint32_t m = millis();
+  if (raw != candidate) {
+    candidate = raw;
+    tStable = m;
+  } else if ((m - tStable) >= 20 && candidate != stable) {
+    stable = candidate;
+  }
+  return stable;
+}
+
+// 3-position switch: exactly one of PD4/PD5/PD6 is LOW (×100 / ×1 / ×10).
+// If none or more than one LOW (transition/bad wiring), default to ×1.
+static uint16_t readHandScaleMultiplier()
+{
+  const bool s100 = (digitalRead(SCALE_X100_PIN) == LOW);
+  const bool s1 = (digitalRead(SCALE_X1_PIN) == LOW);
+  const bool s10 = (digitalRead(SCALE_X10_PIN) == LOW);
+  const int n = (s100 ? 1 : 0) + (s1 ? 1 : 0) + (s10 ? 1 : 0);
+  if (n != 1) return 1;
+  if (s100) return 100;
+  if (s10) return 10;
+  return 1;
+}
+
+static void handPulseOne(StepperJog& j, bool dirPlus)
+{
+  jogSetDir(j, dirPlus);
+  delayMicroseconds(6);
+  writePolarityPin(j.stepPin, true, STEP_ACTIVE_LOW);
+  delayMicroseconds(6);
+  writePolarityPin(j.stepPin, false, STEP_ACTIVE_LOW);
+}
+
+static void updateHandWheelJog()
+{
+  static int32_t hand_q_steps = 0;
+  static HandAxisSel hand_q_axis = HandAxisSel::None;
+  static uint32_t hand_next_us = 0;
+
+  if (motionInhibited()) {
+    hand_q_steps = 0;
+    hand_q_axis = HandAxisSel::None;
+    hand_next_us = 0;
+    return;
+  }
+
+  if (joy_dir != JoyDir::None) {
+    hand_q_steps = 0;
+    hand_q_axis = HandAxisSel::None;
+    hand_next_us = 0;
+    return;
+  }
+
+  const HandAxisSel ax = readHandAxisDebounced();
+  if (ax == HandAxisSel::None) {
+    hand_q_steps = 0;
+    hand_q_axis = HandAxisSel::None;
+    hand_next_us = 0;
+    return;
+  }
+
+  int16_t d = handEncoderReadDelta();
+  if (HAND_ENCODER_INVERT_X && ax == HandAxisSel::X) d = (int16_t)-d;
+  if (d != 0) {
+    const int mult = (int)readHandScaleMultiplier();
+    const int32_t add = (int32_t)d * mult;
+    if (hand_q_axis != HandAxisSel::None && hand_q_axis != ax) {
+      hand_q_steps = 0;
+    }
+    hand_q_axis = ax;
+    hand_q_steps += add;
+  }
+
+  if (hand_q_steps == 0) {
+    hand_next_us = 0;
+    return;
+  }
+
+  uint32_t now = micros();
+  if (hand_next_us == 0) hand_next_us = now;
+
+  static constexpr uint32_t HAND_STEP_PERIOD_US = 400;
+  static constexpr int HAND_MAX_BURST = 24;
+  int burst = HAND_MAX_BURST;
+  while (burst-- > 0 && hand_q_steps != 0 && (int32_t)(now - hand_next_us) >= 0) {
+    const bool forward = hand_q_steps > 0;
+    StepperJog& j = (hand_q_axis == HandAxisSel::Z) ? jogZ : jogX;
+    handPulseOne(j, forward);
+    hand_q_steps += forward ? -1 : 1;
+    hand_next_us += HAND_STEP_PERIOD_US;
+    now = micros();
+  }
+}
+
+static void handEncoderUiSnapshot()
+{
+#if defined(STM32F407xx)
+  g_hand_cnt_disp = (int16_t)LL_TIM_GetCounter(TIM4);
+#else
+  g_hand_cnt_disp = 0;
+#endif
+  g_hand_axis_disp = readHandAxisDebounced();
+  g_hand_scale_mult_disp = readHandScaleMultiplier();
+
+  static int16_t s_last_cnt = 0x7fff;
+  static HandAxisSel s_last_ax = HandAxisSel::None;
+  static uint16_t s_last_sc = 0;
+  if (g_hand_cnt_disp != s_last_cnt || g_hand_axis_disp != s_last_ax || g_hand_scale_mult_disp != s_last_sc) {
+    s_last_cnt = g_hand_cnt_disp;
+    s_last_ax = g_hand_axis_disp;
+    s_last_sc = g_hand_scale_mult_disp;
+    cache_valid = false;
+  }
+}
+
+static void updateStepperJog()
+{
+  const uint32_t sps = feedToStepsPerSecond(feed_x100, rapid_enabled);
+  const uint32_t intervalUs = (sps == 0) ? 0 : (1000000UL / sps);
+
+  // Keep motion direction in sync with debounced joystick reading.
+  // NOTE: updateJoystickMainStyle() only runs on *changes*; stepper must use the latest stable direction.
+  joy_dir = debouncedJoystickDir();
+
+  // Decide which axis/direction is requested by joystick
+  bool wantZ = false, wantX = false;
+  bool zDir = false, xDir = false;
+
+  if (motionInhibited()) {
+    wantZ = false;
+    wantX = false;
+  }
+
+  switch (joy_dir) {
+    case JoyDir::Left:  wantZ = true; zDir = false; break;
+    case JoyDir::Right: wantZ = true; zDir = true;  break;
+    case JoyDir::Up:    wantX = true; xDir = true;  break;
+    case JoyDir::Down:  wantX = true; xDir = false; break;
+    case JoyDir::None:  default: break;
+  }
+
+  jogUpdate(jogZ, wantZ, zDir, intervalUs);
+  jogUpdate(jogX, wantX, xDir, intervalUs);
+
+  updateHandWheelJog();
+}
+
+static void beeperInit()
+{
+  pinMode(BEEPER_PIN, OUTPUT);
+  digitalWrite(BEEPER_PIN, LOW);
+  beeper_on = false;
+  beeper_until_ms = 0;
+}
+
+static void beeperTrigger(uint16_t duration_ms)
+{
+  const uint32_t now = millis();
+  beeper_until_ms = now + duration_ms;
+  if (!beeper_on) {
+    beeper_on = true;
+    digitalWrite(BEEPER_PIN, HIGH);
+  }
+}
+
+static void updateBeeper()
+{
+  if (!beeper_on) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - beeper_until_ms) >= 0) {
+    beeper_on = false;
+    digitalWrite(BEEPER_PIN, LOW);
+  }
+}
+
+static void applyKeyPress(uint8_t key, bool isRepeat = false)
 {
   switch (key) {
     case KEY_SEL:
       // Short press SEL: toggle submode on row0 (main screen) or row1 (submenu)
       if (!in_submenu) {
         if (selected_row == 0) {
-          submode_per_mode[current_mode] = (submode_per_mode[current_mode] == SUB_MAN) ? SUB_INT : SUB_MAN;
+          switch (submode_per_mode[current_mode]) {
+            case SUB_INT: submode_per_mode[current_mode] = SUB_MAN; break;
+            case SUB_MAN: submode_per_mode[current_mode] = SUB_EXT; break;
+            case SUB_EXT: submode_per_mode[current_mode] = SUB_INT; break;
+            default:      submode_per_mode[current_mode] = SUB_INT; break;
+          }
         }
       } else {
         if (selected_row == 1) {
-          submode_per_mode[current_mode] = (submode_per_mode[current_mode] == SUB_MAN) ? SUB_INT : SUB_MAN;
+          switch (submode_per_mode[current_mode]) {
+            case SUB_INT: submode_per_mode[current_mode] = SUB_MAN; break;
+            case SUB_MAN: submode_per_mode[current_mode] = SUB_EXT; break;
+            case SUB_EXT: submode_per_mode[current_mode] = SUB_INT; break;
+            default:      submode_per_mode[current_mode] = SUB_INT; break;
+          }
         }
       }
       break;
     case KEY_UP:
       // Move selection up
-      if (selected_row > 0) selected_row--;
+      selected_row = (selected_row == 0) ? 3 : (uint8_t)(selected_row - 1);
       break;
     case KEY_DOWN:
       // Move selection down
-      if (selected_row < 3) selected_row++;
+      selected_row = (selected_row == 3) ? 0 : (uint8_t)(selected_row + 1);
       break;
     case KEY_LEFT:
       if (!in_submenu) {
         // On main screen: adjust selected values (mode comes from hardware switch)
         if (selected_row == 1) {
           if (feed_x100 > 5) feed_x100 -= 5;
+          pot_locked = true;
         } else if (selected_row == 2) {
           if (pass_total > 1) pass_total -= 1;
           if (pass_cur > pass_total) pass_cur = pass_total;
@@ -494,6 +1006,7 @@ static void applyKeyPress(uint8_t key)
       if (!in_submenu) {
         if (selected_row == 1) {
           if (feed_x100 < 999) feed_x100 += 5;
+          pot_locked = true;
         } else if (selected_row == 2) {
           if (pass_total < 99) pass_total += 1;
         } else if (selected_row == 3) {
@@ -507,6 +1020,7 @@ static void applyKeyPress(uint8_t key)
     default:
       break;
   }
+  if (!isRepeat) beeperTrigger(BEEP_MS);
   updateDisplay();
 }
 
@@ -549,14 +1063,39 @@ static void updateButtonsDebounced()
     selLongFired = false;
   }
 
+  static int8_t repeat_key = -1;
+  static uint32_t repeat_next_ms = 0;
+
   // Debounce for other keys (and for stable-state debug)
   const uint8_t prevStable = stable;
   if ((now - lastRawChangeMs) >= DEBOUNCE_MS) stable = raw;
   const uint8_t pressed = stable & ~prevStable;
-  if (pressed & (1u << KEY_UP))    applyKeyPress(KEY_UP);
-  if (pressed & (1u << KEY_DOWN))  applyKeyPress(KEY_DOWN);
-  if (pressed & (1u << KEY_LEFT))  applyKeyPress(KEY_LEFT);
-  if (pressed & (1u << KEY_RIGHT)) applyKeyPress(KEY_RIGHT);
+
+  auto selectRepeatCandidate = [](uint8_t mask) -> int8_t {
+    if (mask & (1u << KEY_UP)) return KEY_UP;
+    if (mask & (1u << KEY_DOWN)) return KEY_DOWN;
+    if (mask & (1u << KEY_LEFT)) return KEY_LEFT;
+    if (mask & (1u << KEY_RIGHT)) return KEY_RIGHT;
+    return -1;
+  };
+
+  if (pressed & (1u << KEY_UP))    applyKeyPress(KEY_UP, false);
+  if (pressed & (1u << KEY_DOWN))  applyKeyPress(KEY_DOWN, false);
+  if (pressed & (1u << KEY_LEFT))  applyKeyPress(KEY_LEFT, false);
+  if (pressed & (1u << KEY_RIGHT)) applyKeyPress(KEY_RIGHT, false);
+
+  const int8_t cand = selectRepeatCandidate(stable);
+  if (cand != -1) {
+    if (repeat_key != cand) {
+      repeat_key = cand;
+      repeat_next_ms = now + KEY_REPEAT_DELAY_MS;
+    } else if ((int32_t)(now - repeat_next_ms) >= 0) {
+      applyKeyPress((uint8_t)repeat_key, true);
+      repeat_next_ms = now + KEY_REPEAT_RATE_MS;
+    }
+  } else {
+    repeat_key = -1;
+  }
 }
 
 static void updateRapidButton()
@@ -611,10 +1150,36 @@ static void updateFeedFromPot()
   const uint16_t avg = (uint16_t)(adc_sum / 16U);
   const uint16_t new_feed = mapAdcToFeedX100(avg);
 
+  if (pot_locked) {
+    const uint16_t a = (new_feed > feed_x100) ? (new_feed - feed_x100) : (feed_x100 - new_feed);
+    if (a < 10) return;
+    pot_locked = false;
+  }
+
   if (new_feed != feed_x100) {
     feed_x100 = new_feed;
     updateDisplay();
   }
+}
+
+static void syncModeSubmodeNow()
+{
+  const uint8_t m = readModeByte();
+
+  last_pd8_10 = 0;
+  last_pd8_10 |= (digitalRead(SUBMODE_PINS[0]) == HIGH) ? 1U : 0U;
+  last_pd8_10 |= (digitalRead(SUBMODE_PINS[1]) == HIGH) ? 2U : 0U;
+  last_pd8_10 |= (digitalRead(SUBMODE_PINS[2]) == HIGH) ? 4U : 0U;
+
+  Mode newMode;
+  const bool okMode = decodeModeFromByte(m, newMode);
+  if (okMode) current_mode = newMode;
+
+  const SubMode newSub = decodeSubmodeFromRawPd(last_pd8_10);
+  for (uint8_t i = 0; i < MODE_COUNT; i++) submode_per_mode[i] = newSub;
+
+  cache_valid = false;
+  updateDisplay();
 }
 
 static void updateModeSubmodeFromSwitches()
@@ -661,6 +1226,7 @@ static void updateModeSubmodeFromSwitches()
 
   // repaint
   cache_valid = false;
+  beeperTrigger(BEEP_MS);
   updateDisplay();
 }
 
@@ -717,6 +1283,9 @@ void setup()
   lcd.init();
   lcd.backlight();
 
+  beeperInit();
+  stepperInitPins();
+
   pinMode(BTN_LEFT, INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
@@ -729,6 +1298,9 @@ void setup()
   pinMode(JOY_U_PIN, INPUT_PULLUP);
   pinMode(JOY_D_PIN, INPUT_PULLUP);
   pinMode(BTN_RAPID_PIN, INPUT_PULLUP);
+#if ENABLE_HW_MOTION_STOP
+  pinMode(BTN_STOP_PIN, INPUT_PULLUP);
+#endif
 
   // ADC feed potentiometer
   pinMode(ADC_FEED_PIN, INPUT_ANALOG);
@@ -736,16 +1308,30 @@ void setup()
   // Mode/submode switches (use pullups to avoid floating)
   for (uint8_t i = 0; i < 8; i++) pinMode(MODE_PINS[i], INPUT_PULLUP);
   for (uint8_t i = 0; i < 3; i++) pinMode(SUBMODE_PINS[i], INPUT_PULLUP);
+
+  pinMode(AXIS_Z_PIN, INPUT_PULLUP);
+  pinMode(AXIS_X_PIN, INPUT_PULLUP);
+  pinMode(SCALE_X100_PIN, INPUT_PULLUP);
+  pinMode(SCALE_X1_PIN, INPUT_PULLUP);
+  pinMode(SCALE_X10_PIN, INPUT_PULLUP);
+
+  handEncoderHwInit();
+
   delay(5);
 
+  syncModeSubmodeNow();
   updateDisplay(); // initial paint
 }
 
 void loop()
 {
+  handEncoderUiSnapshot();
+
   updateJoystickMainStyle();
   updateModeSubmodeFromSwitches();
   updateRapidButton();
   updateFeedFromPot();
+  updateStepperJog();
   updateButtonsDebounced();
+  updateBeeper();
 }

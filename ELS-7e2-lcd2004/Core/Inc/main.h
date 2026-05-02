@@ -147,6 +147,8 @@ void Error_Handler(void);
 #define LIM_LEFT_GPIO_Port GPIOA
 #define BEEPER_Pin GPIO_PIN_0
 #define BEEPER_GPIO_Port GPIOD
+#define SCALE_X100_Pin GPIO_PIN_4
+#define SCALE_X100_GPIO_Port GPIOD
 #define SCALE_X1_Pin GPIO_PIN_5
 #define SCALE_X1_GPIO_Port GPIOD
 #define SCALE_X10_Pin GPIO_PIN_6
