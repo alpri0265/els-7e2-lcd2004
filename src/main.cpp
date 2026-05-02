@@ -854,20 +854,28 @@ static void updateHandWheelJog()
     return;
   }
 
-  uint32_t now = micros();
-  if (hand_next_us == 0) hand_next_us = now;
+  // Min. interval from *real* time after each pulse. Slower at ×10 / ×100 so the motor
+  // keeps up (burst "catch-up" with the old scheduler could fire dozens of steps ~20µs
+  // apart → stall / lost steps).
+  // Hand-wheel step period (one step per loop when due). ×100 still below burst rates
+  // that caused stalls; tune here if you need more speed vs reliability.
+  auto handPeriodUs = []() -> uint32_t {
+    switch (readHandScaleMultiplier()) {
+      case 100: return 700;
+      case 10:  return 600;
+      default:  return 500;
+    }
+  };
 
-  static constexpr uint32_t HAND_STEP_PERIOD_US = 400;
-  static constexpr int HAND_MAX_BURST = 24;
-  int burst = HAND_MAX_BURST;
-  while (burst-- > 0 && hand_q_steps != 0 && (int32_t)(now - hand_next_us) >= 0) {
-    const bool forward = hand_q_steps > 0;
-    StepperJog& j = (hand_q_axis == HandAxisSel::Z) ? jogZ : jogX;
-    handPulseOne(j, forward);
-    hand_q_steps += forward ? -1 : 1;
-    hand_next_us += HAND_STEP_PERIOD_US;
-    now = micros();
-  }
+  const uint32_t now = micros();
+  if (hand_next_us == 0) hand_next_us = now;
+  if ((int32_t)(now - hand_next_us) < 0) return;
+
+  const bool forward = hand_q_steps > 0;
+  StepperJog& j = (hand_q_axis == HandAxisSel::Z) ? jogZ : jogX;
+  handPulseOne(j, forward);
+  hand_q_steps += forward ? -1 : 1;
+  hand_next_us = micros() + handPeriodUs();
 }
 
 static void handEncoderUiSnapshot()
