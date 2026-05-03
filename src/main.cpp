@@ -1470,10 +1470,30 @@ static uint8_t joyDirToAfeedJoy(JoyDir d)
   }
 }
 
+/* DOC на екрані: doc_x100 = мм×100 (напр. 50 → 0.50 мм). Кроки Z на один «зсув правої межі» —
+   як у Arduino: (MOTOR_Z_STEP_PER_REV * Ap / SCREW_Z) * McSTEP, де Ap у тих же одиницях що doc_x100. */
 static int32_t manAfeedDocToZSteps(uint16_t doc100)
 {
-  return (int32_t)lroundf((float)kManAfeedMotorZStepPerRev * (float)doc100 / (float)kManAfeedScrewZHundredths *
-                          (float)kManAfeedMcStepZ);
+  if (doc100 < 1)
+    return 0;
+  const int32_t calc = (int32_t)lroundf((float)kManAfeedMotorZStepPerRev * (float)doc100 / (float)kManAfeedScrewZHundredths *
+                                          (float)kManAfeedMcStepZ);
+  /* Для DOC < 0.05 мм лишаємо чистий розрахунок; інакше підлога, щоб зсув був помітний на довгому ході. */
+  if (doc100 < 5)
+    return (calc < 1) ? 1 : calc;
+  const int32_t floor_steps = (int32_t)(MCSTEP_Z_SOFT * 40);
+  return (calc > floor_steps) ? calc : floor_steps;
+}
+
+/* Швидкість шатла Z у MAN: не залежить лише від лінійної карти горщика; підняті підлога/стеля. */
+static uint32_t manAfeedZShuttleSps(uint16_t fx100)
+{
+  uint32_t sps = feedToStepsPerSecond(fx100, true);
+  if (sps < 1800U)
+    sps = 1800U;
+  if (sps > 10000U)
+    sps = 10000U;
+  return sps;
 }
 #endif
 
@@ -1517,6 +1537,8 @@ static void updateStepperJog()
         man_afeed_z_cap_active = true;
         man_afeed_z_await_left = false;
         man_afeed_z_started_latch = true;
+        cache_valid = false;
+        updateDisplay();
       }
     }
     if (joy_dir == JoyDir::None)
@@ -1530,10 +1552,7 @@ static void updateStepperJog()
       man_afeed_z_dyn_cap_r = INT32_MAX;
       man_afeed_z_await_left = false;
     } else {
-      /* Швидкість: завжди «rapid» множник + нижня межа sps, щоб цикл не був повільнішим за ручний jog. */
-      uint32_t sps = feedToStepsPerSecond(feed_x100, true);
-      if (sps < 250U)
-        sps = 250U;
+      const uint32_t sps = manAfeedZShuttleSps(feed_x100);
       const uint32_t interval = (sps == 0) ? 0 : (1000000UL / sps);
 
       /* Допуск по Z (кроки): позиційні пороги стабільніші за softLimit у той самий тик, що jogUpdate. */
@@ -1572,10 +1591,11 @@ static void updateStepperJog()
           } else {
             man_afeed_z_dir = true;
           }
+          cache_valid = false;
+          updateDisplay();
         }
       }
     }
-    cache_valid = false;
     updateHandWheelJog();
     return;
   }
