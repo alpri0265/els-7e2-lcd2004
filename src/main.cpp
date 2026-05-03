@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <cmath>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
@@ -199,6 +200,17 @@ static uint8_t pass_total = 10;   // TOTAL passes
 static uint8_t pass_cur = 1;      // Current pass number (1..pass_total)
 static uint16_t doc_x100 = 50;    // 0.50 mm (stored as *100)
 static bool rapid_enabled = false; // "RAPID active now" (momentary like in main)
+
+/* AFEED + MAN: Z між навченими Z-лімітами, PASS/DOC як у 7e2 (DOC → кроки Z за винтом). */
+static constexpr int32_t kManAfeedMotorZStepPerRev = 1000;  // 7e2_Mod...ino
+static constexpr int32_t kManAfeedScrewZHundredths = 400;
+static constexpr int32_t kManAfeedMcStepZ = 2;
+static bool man_afeed_z_cycle = false;
+static bool man_afeed_z_dir = true;            // true = до правого обмеження (зростання motor_z_steps)
+static bool man_afeed_z_started_latch = false;
+static bool man_afeed_z_cap_active = false;     // звужуємо праву межу для softLimitAllowsZ
+static int32_t man_afeed_z_dyn_cap_r = INT32_MAX;
+static bool man_afeed_z_await_left = false;    // після досягнення правого — чекаємо лівий для pass++
 
 // Joystick "manual move" flags (ported from main semantics)
 static bool joy_z_active = false;
@@ -1078,6 +1090,8 @@ static bool softLimitAllowsZ(bool zDirTrue)
     cap_l = adj_l;
     cap_r = adj_r;
   }
+  if (man_afeed_z_cap_active && limit_z_right_on && man_afeed_z_dyn_cap_r < cap_r)
+    cap_r = man_afeed_z_dyn_cap_r;
   if (zDirTrue && limit_z_right_on && motor_z_steps >= cap_r) return false;
   if (!zDirTrue && limit_z_left_on && motor_z_steps <= cap_l) return false;
   return true;
@@ -1455,6 +1469,12 @@ static uint8_t joyDirToAfeedJoy(JoyDir d)
     default: return 0;
   }
 }
+
+static int32_t manAfeedDocToZSteps(uint16_t doc100)
+{
+  return (int32_t)lroundf((float)kManAfeedMotorZStepPerRev * (float)doc100 / (float)kManAfeedScrewZHundredths *
+                          (float)kManAfeedMcStepZ);
+}
 #endif
 
 static void updateStepperJog()
@@ -1472,6 +1492,94 @@ static void updateStepperJog()
   joy_dir = debouncedJoystickDir();
 
 #if ENABLE_SOFTWARE_LIMITS
+  const bool afeed_man =
+      (current_mode == MODE_AFEED && submode_per_mode[current_mode] == SUB_MAN);
+
+  if (!afeed_man || !limit_z_left_on || !limit_z_right_on) {
+    if (man_afeed_z_cycle) {
+      man_afeed_z_cycle = false;
+      man_afeed_z_cap_active = false;
+      man_afeed_z_dyn_cap_r = INT32_MAX;
+      man_afeed_z_await_left = false;
+    }
+    man_afeed_z_started_latch = false;
+  }
+
+  if (afeed_man && limit_z_left_on && limit_z_right_on && pass_total >= 1) {
+    if (joy_dir == JoyDir::Right && !man_afeed_z_started_latch && !man_afeed_z_cycle) {
+      /* Лівий ліміт у кроках має бути «менше» правого, інакше лічильник «лівого» зірветься одразу. */
+      const int32_t z_min_span = (int32_t)(MCSTEP_Z_SOFT * 16);
+      if (limit_pos_z_left + z_min_span < limit_pos_z_right) {
+        man_afeed_z_cycle = true;
+        man_afeed_z_dir = true;
+        pass_cur = 0; /* виконано 0 проходів; після кожного удару вліво +1 */
+        man_afeed_z_dyn_cap_r = limit_pos_z_right;
+        man_afeed_z_cap_active = true;
+        man_afeed_z_await_left = false;
+        man_afeed_z_started_latch = true;
+      }
+    }
+    if (joy_dir == JoyDir::None)
+      man_afeed_z_started_latch = false;
+  }
+
+  if (man_afeed_z_cycle) {
+    if (motionInhibited()) {
+      man_afeed_z_cycle = false;
+      man_afeed_z_cap_active = false;
+      man_afeed_z_dyn_cap_r = INT32_MAX;
+      man_afeed_z_await_left = false;
+    } else {
+      /* Швидкість: завжди «rapid» множник + нижня межа sps, щоб цикл не був повільнішим за ручний jog. */
+      uint32_t sps = feedToStepsPerSecond(feed_x100, true);
+      if (sps < 250U)
+        sps = 250U;
+      const uint32_t interval = (sps == 0) ? 0 : (1000000UL / sps);
+
+      /* Допуск по Z (кроки): позиційні пороги стабільніші за softLimit у той самий тик, що jogUpdate. */
+      const int32_t z_edge_tol = (int32_t)(MCSTEP_Z_SOFT * 6);
+
+      jogUpdate(jogZ, true, man_afeed_z_dir, interval);
+
+      if (man_afeed_z_dir) {
+        const bool at_right =
+            limit_z_right_on && (motor_z_steps >= man_afeed_z_dyn_cap_r - z_edge_tol);
+        if (at_right) {
+          man_afeed_z_dir = false;
+          man_afeed_z_await_left = true;
+        }
+      } else {
+        const bool at_left =
+            man_afeed_z_await_left && limit_z_left_on &&
+            (motor_z_steps <= limit_pos_z_left + z_edge_tol);
+        if (at_left) {
+          man_afeed_z_await_left = false;
+          if (pass_cur < 255)
+            pass_cur++;
+          const int32_t dz = manAfeedDocToZSteps(doc_x100);
+          if (dz > 0) {
+            const int32_t cap_l = limit_pos_z_left;
+            const int32_t min_r = cap_l + (int32_t)(MCSTEP_Z_SOFT * 8);
+            man_afeed_z_dyn_cap_r -= dz;
+            if (man_afeed_z_dyn_cap_r < min_r)
+              man_afeed_z_dyn_cap_r = min_r;
+          }
+          if (pass_cur >= pass_total) {
+            man_afeed_z_cycle = false;
+            man_afeed_z_cap_active = false;
+            man_afeed_z_dyn_cap_r = INT32_MAX;
+            /* pass_cur = виконані проходи; залишаємо N/N на дисплеї, новий старт знову з 0 */
+          } else {
+            man_afeed_z_dir = true;
+          }
+        }
+      }
+    }
+    cache_valid = false;
+    updateHandWheelJog();
+    return;
+  }
+
   bool awz = false, awx = false, aZd = false, aXd = false, zrap = false, xrap = false;
   const uint32_t spsFeedOnly = feedToStepsPerSecond(feed_x100, false);
   const uint32_t intervalUs = (spsFeedOnly == 0) ? 0 : (1000000UL / spsFeedOnly);
