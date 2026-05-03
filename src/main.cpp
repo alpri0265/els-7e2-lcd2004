@@ -309,7 +309,8 @@ static SubMode decodeSubmodeFromRawPd(uint8_t pd8_10_highmask)
   if (!pd8_high) return SUB_MAN;
   if (!pd9_high) return SUB_EXT;
   if (!pd10_high) return SUB_INT;
-  return SUB_INT; // open position (D:111)
+  /* Усі лінії HIGH: невалідний/проміжний стан перемикача — не INT (Arduino не вважає це INT). */
+  return SUB_MAN;
 }
 
 static void applySelectionMarker(uint8_t row, char s[21])
