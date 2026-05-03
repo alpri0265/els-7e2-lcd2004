@@ -52,6 +52,28 @@ static constexpr uint8_t BTN_RAPID_PIN = PD7;
 static constexpr uint8_t BTN_STOP_PIN = PB13;
 #endif
 
+// Arduino-style soft limits: panel inputs record Motor_* position in steps (teach). Motion stops at
+// stored coordinates. Second press clears that limit. MECH_* = hardware trip (blocks all motion).
+// CubeMX names → teach function: PA11 LEFT / PA10 RIGHT = Z ends; PA9 FRONT / PA8 REAR = X ends.
+#define ENABLE_SOFTWARE_LIMITS 1
+#if ENABLE_SOFTWARE_LIMITS
+static constexpr uint8_t TEACH_LIMIT_X_REAR_PIN = PA8;
+static constexpr uint8_t TEACH_LIMIT_X_FRONT_PIN = PA9;
+static constexpr uint8_t TEACH_LIMIT_Z_RIGHT_PIN = PA10;
+static constexpr uint8_t TEACH_LIMIT_Z_LEFT_PIN  = PA11;
+static constexpr uint8_t LIM_MECH_1_PIN = PD1;
+static constexpr uint8_t LIM_MECH_2_PIN = PD14;
+static constexpr uint8_t LED_LIM_REAR_PIN  = PG12;  // X rear armed
+static constexpr uint8_t LED_LIM_FRONT_PIN = PG13;  // X front armed
+static constexpr uint8_t LED_LIM_RIGHT_PIN = PG14;  // Z right armed
+static constexpr uint8_t LED_LIM_LEFT_PIN  = PG15;  // Z left armed
+static constexpr int32_t LIMIT_TEACH_MARGIN_STEPS = 100;
+static constexpr int32_t MCSTEP_Z_SOFT = 2;
+static constexpr int32_t MCSTEP_X_SOFT = 4;
+static int32_t motor_z_steps = 0;
+static int32_t motor_x_steps = 0;
+#endif
+
 // Feed potentiometer (CubeMX wiring): ADC on PF6
 static constexpr uint8_t ADC_FEED_PIN = PF6;
 
@@ -613,6 +635,11 @@ static uint32_t feedToStepsPerSecond(uint16_t fx100, bool rapid)
   return rapid ? (sps * 3U) : sps;
 }
 
+#if ENABLE_SOFTWARE_LIMITS
+static bool softLimitAllowsZ(bool zDirTrue);
+static bool softLimitAllowsX(bool xDirTrue);
+#endif
+
 static void jogSetEnabled(StepperJog& j, bool en)
 {
   if (j.enabled == en) return;
@@ -678,6 +705,21 @@ static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t st
     // no further pulses will be generated.
     if (!j.dirSetupPending || (int32_t)(now - j.dirSetupUntilUs) >= 0) {
       if (j.dirSetupPending) j.dirSetupPending = false;
+#if ENABLE_SOFTWARE_LIMITS
+      if (&j == &jogZ) {
+        if (!softLimitAllowsZ(dirLogical)) {
+          jogSetEnabled(j, false);
+          return;
+        }
+        motor_z_steps += dirLogical ? 1 : -1;
+      } else if (&j == &jogX) {
+        if (!softLimitAllowsX(dirLogical)) {
+          jogSetEnabled(j, false);
+          return;
+        }
+        motor_x_steps += dirLogical ? 1 : -1;
+      }
+#endif
       j.stepIsActive = true;
       writePolarityPin(j.stepPin, true, STEP_ACTIVE_LOW);
       j.stepOffAtUs = now + PULSE_US;
@@ -686,8 +728,224 @@ static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t st
   }
 }
 
+#if ENABLE_SOFTWARE_LIMITS
+static void beeperTrigger(uint16_t duration_ms);
+
+static constexpr int32_t kLimitPosMax = INT32_MAX;
+static constexpr int32_t kLimitPosMin = INT32_MIN;
+
+static bool limit_z_left_on = false;
+static bool limit_z_right_on = false;
+static bool limit_x_front_on = false;
+static bool limit_x_rear_on = false;
+static int32_t limit_pos_z_left = kLimitPosMax;
+static int32_t limit_pos_z_right = kLimitPosMin;
+static int32_t limit_pos_x_front = kLimitPosMax;
+static int32_t limit_pos_x_rear = kLimitPosMin;
+
+static int32_t alignToMcStep(int32_t pos, int32_t mc)
+{
+  if (mc <= 1) return pos;
+  const int32_t half = mc / 2;
+  return (int32_t)(((pos + half) / mc) * mc);
+}
+
+static bool limitsMechTripRaw()
+{
+  return (digitalRead(LIM_MECH_1_PIN) == LOW) || (digitalRead(LIM_MECH_2_PIN) == LOW);
+}
+
+static bool limitsMechTripDebounced()
+{
+  static bool stable = false;
+  static bool cand = false;
+  static uint32_t t0 = 0;
+  const bool raw = limitsMechTripRaw();
+  const uint32_t m = millis();
+  if (raw != cand) {
+    cand = raw;
+    t0 = m;
+  } else if ((m - t0) >= 15 && cand != stable) {
+    stable = cand;
+  }
+  return stable;
+}
+
+static void limitsLedsRefresh()
+{
+  digitalWrite(LED_LIM_LEFT_PIN, limit_z_left_on ? HIGH : LOW);
+  digitalWrite(LED_LIM_RIGHT_PIN, limit_z_right_on ? HIGH : LOW);
+  digitalWrite(LED_LIM_FRONT_PIN, limit_x_front_on ? HIGH : LOW);
+  digitalWrite(LED_LIM_REAR_PIN, limit_x_rear_on ? HIGH : LOW);
+}
+
+static void limitsInitPins()
+{
+  pinMode(TEACH_LIMIT_Z_LEFT_PIN, INPUT_PULLUP);
+  pinMode(TEACH_LIMIT_Z_RIGHT_PIN, INPUT_PULLUP);
+  pinMode(TEACH_LIMIT_X_FRONT_PIN, INPUT_PULLUP);
+  pinMode(TEACH_LIMIT_X_REAR_PIN, INPUT_PULLUP);
+  pinMode(LIM_MECH_1_PIN, INPUT_PULLUP);
+  pinMode(LIM_MECH_2_PIN, INPUT_PULLUP);
+  pinMode(LED_LIM_REAR_PIN, OUTPUT);
+  pinMode(LED_LIM_FRONT_PIN, OUTPUT);
+  pinMode(LED_LIM_RIGHT_PIN, OUTPUT);
+  pinMode(LED_LIM_LEFT_PIN, OUTPUT);
+  limitsLedsRefresh();
+}
+
+static bool joyZIdleForTeach()
+{
+  const JoyDir d = debouncedJoystickDir();
+  return d != JoyDir::Left && d != JoyDir::Right;
+}
+
+static bool joyXIdleForTeach()
+{
+  const JoyDir d = debouncedJoystickDir();
+  return d != JoyDir::Up && d != JoyDir::Down;
+}
+
+static void teachLimitZLeft()
+{
+  if (!joyZIdleForTeach()) return;
+  if (!limit_z_left_on) {
+    if (limit_z_right_on && motor_z_steps <= limit_pos_z_right + LIMIT_TEACH_MARGIN_STEPS) return;
+    limit_pos_z_left = alignToMcStep(motor_z_steps, MCSTEP_Z_SOFT);
+    limit_z_left_on = true;
+  } else {
+    limit_z_left_on = false;
+    limit_pos_z_left = kLimitPosMax;
+  }
+  limitsLedsRefresh();
+  beeperTrigger(BEEP_MS);
+  cache_valid = false;
+}
+
+static void teachLimitZRight()
+{
+  if (!joyZIdleForTeach()) return;
+  if (!limit_z_right_on) {
+    if (limit_z_left_on && motor_z_steps >= limit_pos_z_left - LIMIT_TEACH_MARGIN_STEPS) return;
+    limit_pos_z_right = alignToMcStep(motor_z_steps, MCSTEP_Z_SOFT);
+    limit_z_right_on = true;
+  } else {
+    limit_z_right_on = false;
+    limit_pos_z_right = kLimitPosMin;
+  }
+  limitsLedsRefresh();
+  beeperTrigger(BEEP_MS);
+  cache_valid = false;
+}
+
+static void teachLimitXFront()
+{
+  if (!joyXIdleForTeach()) return;
+  if (!limit_x_front_on) {
+    if (limit_x_rear_on && motor_x_steps <= limit_pos_x_rear + LIMIT_TEACH_MARGIN_STEPS) return;
+    limit_pos_x_front = alignToMcStep(motor_x_steps, MCSTEP_X_SOFT);
+    limit_x_front_on = true;
+  } else {
+    limit_x_front_on = false;
+    limit_pos_x_front = kLimitPosMax;
+  }
+  limitsLedsRefresh();
+  beeperTrigger(BEEP_MS);
+  cache_valid = false;
+}
+
+static void teachLimitXRear()
+{
+  if (!joyXIdleForTeach()) return;
+  if (!limit_x_rear_on) {
+    if (limit_x_front_on && motor_x_steps >= limit_pos_x_front - LIMIT_TEACH_MARGIN_STEPS) return;
+    limit_pos_x_rear = alignToMcStep(motor_x_steps, MCSTEP_X_SOFT);
+    limit_x_rear_on = true;
+  } else {
+    limit_x_rear_on = false;
+    limit_pos_x_rear = kLimitPosMin;
+  }
+  limitsLedsRefresh();
+  beeperTrigger(BEEP_MS);
+  cache_valid = false;
+}
+
+static uint8_t teachPinsRawMask()
+{
+  uint8_t m = 0;
+  if (digitalRead(TEACH_LIMIT_Z_LEFT_PIN) == LOW) m |= 1u << 0;
+  if (digitalRead(TEACH_LIMIT_Z_RIGHT_PIN) == LOW) m |= 1u << 1;
+  if (digitalRead(TEACH_LIMIT_X_FRONT_PIN) == LOW) m |= 1u << 2;
+  if (digitalRead(TEACH_LIMIT_X_REAR_PIN) == LOW) m |= 1u << 3;
+  return m;
+}
+
+static void limitTeachPoll()
+{
+  static uint8_t stable = 0;
+  static uint8_t cand = 0;
+  static uint32_t tStable = 0;
+  static uint8_t held = 0;
+
+  const uint8_t raw = teachPinsRawMask();
+  const uint32_t m = millis();
+  if (raw != cand) {
+    cand = raw;
+    tStable = m;
+  } else if ((m - tStable) >= 30 && cand != stable) {
+    stable = cand;
+  }
+
+  const uint8_t edge = (uint8_t)(stable & (uint8_t)~held);
+  held = stable;
+
+  if (limitsMechTripDebounced()) return;
+
+  if (edge & (1u << 0)) teachLimitZLeft();
+  if (edge & (1u << 1)) teachLimitZRight();
+  if (edge & (1u << 2)) teachLimitXFront();
+  if (edge & (1u << 3)) teachLimitXRear();
+}
+
+static void updateSoftwareLimits()
+{
+  (void)limitsMechTripDebounced();
+  limitTeachPoll();
+}
+
+static bool limitsMechTrip()
+{
+  return limitsMechTripDebounced();
+}
+
+// true = allow step in this direction (Arduino-style soft limits + MECH).
+static bool softLimitAllowsZ(bool zDirTrue)
+{
+  if (limitsMechTrip()) return false;
+  if (zDirTrue && limit_z_right_on && motor_z_steps >= limit_pos_z_right) return false;
+  if (!zDirTrue && limit_z_left_on && motor_z_steps <= limit_pos_z_left) return false;
+  return true;
+}
+
+static bool softLimitAllowsX(bool xDirTrue)
+{
+  if (limitsMechTrip()) return false;
+  if (xDirTrue && limit_x_front_on && motor_x_steps >= limit_pos_x_front) return false;
+  if (!xDirTrue && limit_x_rear_on && motor_x_steps <= limit_pos_x_rear) return false;
+  return true;
+}
+#else
+static void limitsInitPins() {}
+static void updateSoftwareLimits() {}
+static bool softLimitAllowsZ(bool) { return true; }
+static bool softLimitAllowsX(bool) { return true; }
+#endif
+
 static bool motionInhibited()
 {
+#if ENABLE_SOFTWARE_LIMITS
+  if (limitsMechTrip()) return true;
+#endif
 #if !ENABLE_HW_MOTION_STOP
   return false;
 #else
@@ -807,6 +1065,10 @@ static void handPulseOne(StepperJog& j, bool dirPlus)
   writePolarityPin(j.stepPin, true, STEP_ACTIVE_LOW);
   delayMicroseconds(6);
   writePolarityPin(j.stepPin, false, STEP_ACTIVE_LOW);
+#if ENABLE_SOFTWARE_LIMITS
+  if (&j == &jogZ) motor_z_steps += dirPlus ? 1 : -1;
+  else if (&j == &jogX) motor_x_steps += dirPlus ? 1 : -1;
+#endif
 }
 
 static void updateHandWheelJog()
@@ -841,17 +1103,39 @@ static void updateHandWheelJog()
   if (HAND_ENCODER_INVERT_X && ax == HandAxisSel::X) d = (int16_t)-d;
   if (d != 0) {
     const int mult = (int)readHandScaleMultiplier();
-    const int32_t add = (int32_t)d * mult;
+    int32_t add = (int32_t)d * mult;
     if (hand_q_axis != HandAxisSel::None && hand_q_axis != ax) {
       hand_q_steps = 0;
     }
     hand_q_axis = ax;
+    if (ax == HandAxisSel::Z) {
+      if (add > 0 && !softLimitAllowsZ(true)) add = 0;
+      if (add < 0 && !softLimitAllowsZ(false)) add = 0;
+    } else {
+      if (add > 0 && !softLimitAllowsX(true)) add = 0;
+      if (add < 0 && !softLimitAllowsX(false)) add = 0;
+    }
     hand_q_steps += add;
   }
 
   if (hand_q_steps == 0) {
     hand_next_us = 0;
     return;
+  }
+
+  const bool forward = hand_q_steps > 0;
+  if (hand_q_axis == HandAxisSel::Z) {
+    if (!softLimitAllowsZ(forward)) {
+      hand_q_steps = 0;
+      hand_next_us = 0;
+      return;
+    }
+  } else {
+    if (!softLimitAllowsX(forward)) {
+      hand_q_steps = 0;
+      hand_next_us = 0;
+      return;
+    }
   }
 
   // Min. interval from *real* time after each pulse. Slower at ×10 / ×100 so the motor
@@ -871,7 +1155,6 @@ static void updateHandWheelJog()
   if (hand_next_us == 0) hand_next_us = now;
   if ((int32_t)(now - hand_next_us) < 0) return;
 
-  const bool forward = hand_q_steps > 0;
   StepperJog& j = (hand_q_axis == HandAxisSel::Z) ? jogZ : jogX;
   handPulseOne(j, forward);
   hand_q_steps += forward ? -1 : 1;
@@ -924,6 +1207,9 @@ static void updateStepperJog()
     case JoyDir::Down:  wantX = true; xDir = false; break;
     case JoyDir::None:  default: break;
   }
+
+  if (wantZ && !softLimitAllowsZ(zDir)) wantZ = false;
+  if (wantX && !softLimitAllowsX(xDir)) wantX = false;
 
   jogUpdate(jogZ, wantZ, zDir, intervalUs);
   jogUpdate(jogX, wantX, xDir, intervalUs);
@@ -1293,6 +1579,7 @@ void setup()
 
   beeperInit();
   stepperInitPins();
+  limitsInitPins();
 
   pinMode(BTN_LEFT, INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT_PULLUP);
@@ -1334,6 +1621,7 @@ void setup()
 void loop()
 {
   handEncoderUiSnapshot();
+  updateSoftwareLimits();
 
   updateJoystickMainStyle();
   updateModeSubmodeFromSwitches();
