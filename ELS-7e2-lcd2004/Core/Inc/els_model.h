@@ -12,6 +12,13 @@
 #define SCREW_X              150   /* сотки мм */
 #define McSTEP_X             4
 
+/* Rapid / limit teach (Arduino: MAX_RAPID_MOTION, MIN_RAPID_MOTION, REPEAt) */
+#define MAX_RAPID_MOTION     40
+#define MIN_RAPID_MOTION     (MAX_RAPID_MOTION + 165)
+#define ELS_REPEAT           (McSTEP_Z * 1)
+#define REBOUND_X            1500  /* microsteps */
+#define REBOUND_Z            1500
+
 #define MIN_FEED             2     /* сотки/оборот */
 #define MAX_FEED             25
 #define MIN_aFEED            20    /* мм/мин */

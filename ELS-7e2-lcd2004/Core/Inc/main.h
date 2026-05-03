@@ -169,7 +169,10 @@ void Error_Handler(void);
 #define BTN_MENU_R_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+#define LIM_MECH_1_Pin GPIO_PIN_1
+#define LIM_MECH_1_GPIO_Port GPIOD
+#define LIM_MECH_2_Pin GPIO_PIN_14
+#define LIM_MECH_2_GPIO_Port GPIOD
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

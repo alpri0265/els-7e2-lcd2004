@@ -5,6 +5,7 @@
 
 # Add inputs and outputs from these tool invocations to the build variables 
 C_SRCS += \
+../Core/Src/els_limits.c \
 ../Core/Src/els_menu.c \
 ../Core/Src/els_model.c \
 ../Core/Src/lcd_hd44780.c \
@@ -18,6 +19,7 @@ C_SRCS += \
 ../Core/Src/system_stm32f4xx.c 
 
 OBJS += \
+./Core/Src/els_limits.o \
 ./Core/Src/els_menu.o \
 ./Core/Src/els_model.o \
 ./Core/Src/lcd_hd44780.o \
@@ -31,6 +33,7 @@ OBJS += \
 ./Core/Src/system_stm32f4xx.o 
 
 C_DEPS += \
+./Core/Src/els_limits.d \
 ./Core/Src/els_menu.d \
 ./Core/Src/els_model.d \
 ./Core/Src/lcd_hd44780.d \

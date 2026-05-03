@@ -1,7 +1,10 @@
 #include "els_menu.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "els_limits.h"
 
 /* Custom chars from Arduino sketch (indexes 1..6) */
 static const uint8_t chr_left[8]   = {0x00,0x04,0x08,0x1F,0x08,0x04,0x00,0x00};
@@ -31,6 +34,25 @@ static void els_beep_stub(void)
 {
 	/* TODO: wire to BEEPER pin later */
 }
+
+/* Arduino Print.ino: X_pos/Z_pos are microsteps; display = hundredths mm */
+static long els_disp_x_mm100(const els_menu_t *m)
+{
+	return (long)(m->x_pos / ((float)MOTOR_X_STEP_PER_REV / (float)SCREW_X * (float)McSTEP_X));
+}
+
+static long els_disp_z_mm100(const els_menu_t *m)
+{
+	return (long)(m->z_pos / ((float)MOTOR_Z_STEP_PER_REV / (float)SCREW_Z * (float)McSTEP_Z));
+}
+
+static void fmt_axis_mm_row(char *row, size_t row_sz, char axis_letter, long size_mm100)
+{
+	long a = labs(size_mm100);
+	snprintf(row, row_sz, "Ocь %c:      %3ld.%02ldмм", axis_letter, (long)(a / 100L), (long)(a % 100L));
+}
+
+static uint8_t read_submode_bits(const els_menu_t *m);
 
 static void key_select_pressed(els_menu_t *m)
 {
@@ -390,7 +412,16 @@ void els_menu_init(els_menu_t *m, lcd_hd44780_t *lcd, menu_keys_t *keys)
 	lcd_hd44780_create_char(lcd, 5, chr_degree);
 	lcd_hd44780_create_char(lcd, 6, chr_diam);
 
+	m->submode_hw_prev = 0;
+	m->submode_force_man = false;
+	els_limits_init();
+
 	els_menu_render(m);
+}
+
+void els_menu_pins_ready(els_menu_t *m)
+{
+	if (m->submode_port) m->submode_hw_prev = read_submode_bits(m);
 }
 
 static uint8_t joy_read_nibble(const els_menu_t *m)
@@ -466,7 +497,7 @@ static uint8_t read_mode_byte(const els_menu_t *m)
 
 static uint8_t read_submode_bits(const els_menu_t *m)
 {
-	/* SUBMODE_0..2 are on GPIOD8..10, we want them in bits 5..7 like Arduino Submode_Read */
+	/* SUBMODE_0..2 are on GPIOD8..10, packed to bits 5..7 like Arduino Submode_Read */
 	uint32_t idr = m->submode_port->IDR;
 	uint8_t b = 0;
 	b |= ((idr & (1U << 8))  ? (1U << 5) : 0U);
@@ -477,6 +508,55 @@ static uint8_t read_submode_bits(const els_menu_t *m)
 
 void els_menu_update(els_menu_t *m, uint32_t now_ms)
 {
+	if (m->submode_port)
+	{
+		uint8_t sub = read_submode_bits(m);
+		if (sub != m->submode_hw_prev)
+		{
+			els_limits_on_submode_edge(m, m->submode_hw_prev, sub);
+			m->submode_hw_prev = sub;
+		}
+		if (sub == 0xA0U) m->submode_force_man = false;
+
+		if (m->submode_force_man)
+		{
+			m->sub_thread = ELS_SUB_MAN;
+			m->sub_feed = ELS_SUB_MAN;
+			m->sub_afeed = ELS_SUB_MAN;
+			m->sub_cone = ELS_SUB_MAN;
+			m->sub_sphere = ELS_SUB_MAN;
+		}
+		else
+		{
+			if (sub == 0xC0U)
+			{
+				m->sub_thread = ELS_SUB_INT;
+				m->sub_feed = ELS_SUB_INT;
+				m->sub_afeed = ELS_SUB_INT;
+				m->sub_cone = ELS_SUB_INT;
+				m->sub_sphere = ELS_SUB_INT;
+			}
+			else if (sub == 0xA0U)
+			{
+				m->sub_thread = ELS_SUB_MAN;
+				m->sub_feed = ELS_SUB_MAN;
+				m->sub_afeed = ELS_SUB_MAN;
+				m->sub_cone = ELS_SUB_MAN;
+				m->sub_sphere = ELS_SUB_MAN;
+			}
+			else if (sub == 0x60U)
+			{
+				m->sub_thread = ELS_SUB_EXT;
+				m->sub_feed = ELS_SUB_EXT;
+				m->sub_afeed = ELS_SUB_EXT;
+				m->sub_cone = ELS_SUB_EXT;
+				m->sub_sphere = ELS_SUB_EXT;
+			}
+		}
+	}
+
+	els_limits_update(m, now_ms);
+
 	menu_keys_update(m->keys, now_ms);
 
 	/* edge events */
@@ -521,36 +601,6 @@ void els_menu_update(els_menu_t *m, uint32_t now_ms)
 		else if (mode_new == 0xFEU) m->mode = ELS_MODE_RESERVE;
 	}
 
-	/* Submode switch */
-	if (m->submode_port)
-	{
-		uint8_t sub = read_submode_bits(m);
-		if (sub == 0xC0U)
-		{
-			m->sub_thread = ELS_SUB_INT;
-			m->sub_feed = ELS_SUB_INT;
-			m->sub_afeed = ELS_SUB_INT;
-			m->sub_cone = ELS_SUB_INT;
-			m->sub_sphere = ELS_SUB_INT;
-		}
-		else if (sub == 0xA0U)
-		{
-			m->sub_thread = ELS_SUB_MAN;
-			m->sub_feed = ELS_SUB_MAN;
-			m->sub_afeed = ELS_SUB_MAN;
-			m->sub_cone = ELS_SUB_MAN;
-			m->sub_sphere = ELS_SUB_MAN;
-		}
-		else if (sub == 0x60U)
-		{
-			m->sub_thread = ELS_SUB_EXT;
-			m->sub_feed = ELS_SUB_EXT;
-			m->sub_afeed = ELS_SUB_EXT;
-			m->sub_cone = ELS_SUB_EXT;
-			m->sub_sphere = ELS_SUB_EXT;
-		}
-	}
-
 	/* autorepeat for held keys (U/D/L/R only) */
 	uint8_t mask = menu_keys_get_pressed_mask(m->keys);
 	uint8_t repeat_mask = mask & 0x0FU; /* bits: L,R,U,D */
@@ -558,6 +608,7 @@ void els_menu_update(els_menu_t *m, uint32_t now_ms)
 	if (repeat_mask == 0)
 	{
 		m->last_pressed_mask = 0;
+		els_limits_update(m, now_ms);
 		return;
 	}
 
@@ -566,11 +617,20 @@ void els_menu_update(els_menu_t *m, uint32_t now_ms)
 		m->last_pressed_mask = repeat_mask;
 		m->pressed_since_ms = now_ms;
 		m->last_repeat_ms = now_ms;
+		els_limits_update(m, now_ms);
 		return;
 	}
 
-	if ((now_ms - m->pressed_since_ms) < m->repeat_enter_ms) return;
-	if ((now_ms - m->last_repeat_ms) < m->repeat_rate_ms) return;
+	if ((now_ms - m->pressed_since_ms) < m->repeat_enter_ms)
+	{
+		els_limits_update(m, now_ms);
+		return;
+	}
+	if ((now_ms - m->last_repeat_ms) < m->repeat_rate_ms)
+	{
+		els_limits_update(m, now_ms);
+		return;
+	}
 
 	m->last_repeat_ms = now_ms;
 
@@ -579,11 +639,22 @@ void els_menu_update(els_menu_t *m, uint32_t now_ms)
 	else if (repeat_mask & (1U << 2)) handle_key_event(m, MENU_KEY_U);
 	else if (repeat_mask & (1U << 1)) handle_key_event(m, MENU_KEY_R);
 	else if (repeat_mask & (1U << 0)) handle_key_event(m, MENU_KEY_L);
+
+	els_limits_update(m, now_ms);
 }
 
 void els_menu_render(els_menu_t *m)
 {
 	lcd_rus_t *r = &m->rus;
+
+	if (els_limits_mech_stop())
+	{
+		lcd_rus_set_cursor(r, 0, 0); lcd_write_padded(r, "MECH STOP (LIM)");
+		lcd_rus_set_cursor(r, 0, 1); lcd_write_padded(r, "LIM_MECH_1/2 LOW");
+		lcd_rus_set_cursor(r, 0, 2); lcd_write_padded(r, "   Движение стоп");
+		lcd_rus_set_cursor(r, 0, 3); lcd_write_padded(r, "");
+		return;
+	}
 
 	if (m->err_1)
 	{
@@ -641,9 +712,9 @@ void els_menu_render(els_menu_t *m)
 			{
 				lcd_rus_set_cursor(r, 0, 0); lcd_write_padded(r, "");
 				lcd_rus_set_cursor(r, 0, 1); lcd_write_padded(r, "");
-				snprintf(row, sizeof(row), "Ocь X:      %3ld.%02ldмм", (m->x_pos >= 0) ? (m->x_pos / 100) : (-m->x_pos / 100), (m->x_pos >= 0) ? (m->x_pos % 100) : (-m->x_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'X', els_disp_x_mm100(m));
 				lcd_rus_set_cursor(r, 0, 2); lcd_write_padded(r, row);
-				snprintf(row, sizeof(row), "Ocь Z:      %3ld.%02ldмм", (m->z_pos >= 0) ? (m->z_pos / 100) : (-m->z_pos / 100), (m->z_pos >= 0) ? (m->z_pos % 100) : (-m->z_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'Z', els_disp_z_mm100(m));
 				lcd_rus_set_cursor(r, 0, 3); lcd_write_padded(r, row);
 			}
 			break;
@@ -709,9 +780,9 @@ void els_menu_render(els_menu_t *m)
 			{
 				lcd_rus_set_cursor(r, 0, 0); lcd_write_padded(r, "");
 				lcd_rus_set_cursor(r, 0, 1); lcd_write_padded(r, "");
-				snprintf(row, sizeof(row), "Ocь X:      %3ld.%02ldмм", (m->x_pos >= 0) ? (m->x_pos / 100) : (-m->x_pos / 100), (m->x_pos >= 0) ? (m->x_pos % 100) : (-m->x_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'X', els_disp_x_mm100(m));
 				lcd_rus_set_cursor(r, 0, 2); lcd_write_padded(r, row);
-				snprintf(row, sizeof(row), "Ocь Z:      %3ld.%02ldмм", (m->z_pos >= 0) ? (m->z_pos / 100) : (-m->z_pos / 100), (m->z_pos >= 0) ? (m->z_pos % 100) : (-m->z_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'Z', els_disp_z_mm100(m));
 				lcd_rus_set_cursor(r, 0, 3); lcd_write_padded(r, row);
 			}
 			break;
@@ -778,9 +849,9 @@ void els_menu_render(els_menu_t *m)
 			{
 				lcd_rus_set_cursor(r, 0, 0); lcd_write_padded(r, "");
 				lcd_rus_set_cursor(r, 0, 1); lcd_write_padded(r, "");
-				snprintf(row, sizeof(row), "Ocь X:      %3ld.%02ldмм", (m->x_pos >= 0) ? (m->x_pos / 100) : (-m->x_pos / 100), (m->x_pos >= 0) ? (m->x_pos % 100) : (-m->x_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'X', els_disp_x_mm100(m));
 				lcd_rus_set_cursor(r, 0, 2); lcd_write_padded(r, row);
-				snprintf(row, sizeof(row), "Ocь Z:      %3ld.%02ldмм", (m->z_pos >= 0) ? (m->z_pos / 100) : (-m->z_pos / 100), (m->z_pos >= 0) ? (m->z_pos % 100) : (-m->z_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'Z', els_disp_z_mm100(m));
 				lcd_rus_set_cursor(r, 0, 3); lcd_write_padded(r, row);
 			}
 			break;
@@ -825,9 +896,9 @@ void els_menu_render(els_menu_t *m)
 			{
 				lcd_rus_set_cursor(r, 0, 0); lcd_write_padded(r, "");
 				lcd_rus_set_cursor(r, 0, 1); lcd_write_padded(r, "");
-				snprintf(row, sizeof(row), "Ocь X:      %3ld.%02ldмм", (m->x_pos >= 0) ? (m->x_pos / 100) : (-m->x_pos / 100), (m->x_pos >= 0) ? (m->x_pos % 100) : (-m->x_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'X', els_disp_x_mm100(m));
 				lcd_rus_set_cursor(r, 0, 2); lcd_write_padded(r, row);
-				snprintf(row, sizeof(row), "Ocь Z:      %3ld.%02ldмм", (m->z_pos >= 0) ? (m->z_pos / 100) : (-m->z_pos / 100), (m->z_pos >= 0) ? (m->z_pos % 100) : (-m->z_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'Z', els_disp_z_mm100(m));
 				lcd_rus_set_cursor(r, 0, 3); lcd_write_padded(r, row);
 			}
 			break;
@@ -867,9 +938,9 @@ void els_menu_render(els_menu_t *m)
 			{
 				lcd_rus_set_cursor(r, 0, 0); lcd_write_padded(r, "");
 				lcd_rus_set_cursor(r, 0, 1); lcd_write_padded(r, "");
-				snprintf(row, sizeof(row), "Ocь X:      %3ld.%02ldмм", (m->x_pos >= 0) ? (m->x_pos / 100) : (-m->x_pos / 100), (m->x_pos >= 0) ? (m->x_pos % 100) : (-m->x_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'X', els_disp_x_mm100(m));
 				lcd_rus_set_cursor(r, 0, 2); lcd_write_padded(r, row);
-				snprintf(row, sizeof(row), "Ocь Z:      %3ld.%02ldмм", (m->z_pos >= 0) ? (m->z_pos / 100) : (-m->z_pos / 100), (m->z_pos >= 0) ? (m->z_pos % 100) : (-m->z_pos % 100));
+				fmt_axis_mm_row(row, sizeof(row), 'Z', els_disp_z_mm100(m));
 				lcd_rus_set_cursor(r, 0, 3); lcd_write_padded(r, row);
 			}
 			break;

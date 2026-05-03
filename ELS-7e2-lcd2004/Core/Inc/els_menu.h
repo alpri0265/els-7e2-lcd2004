@@ -23,7 +23,7 @@ typedef enum
 
 typedef enum { ELS_SUB_INT = 1, ELS_SUB_MAN, ELS_SUB_EXT } els_submode_t;
 
-typedef struct
+typedef struct els_menu_tag
 {
 	lcd_hd44780_t *lcd;
 	lcd_rus_t rus;
@@ -76,7 +76,7 @@ typedef struct
 	uint16_t feed_mm;   /* сотки мм/об (MIN_FEED..MAX_FEED) */
 	uint16_t afeedback_mm; /* mm/min (MIN_aFEED..MAX_aFEED) */
 
-	/* positions (hundredths of mm in sketch; here just counters) */
+	/* Motor microstep counters (same as Arduino Motor_X_Pos / Motor_Z_Pos) */
 	long x_pos;
 	long z_pos;
 
@@ -98,9 +98,16 @@ typedef struct
 	uint8_t joy_old_nibble; /* like Arduino Joy_Read low-nibble */
 	uint32_t joy_last_change_ms;
 	uint32_t joy_debounce_ms;
+
+	/* raw submode lines (PD8..10 packed to bits 5..7); edge detect for limit INT/EXT */
+	uint8_t submode_hw_prev;
+	/* After failed INT/EXT (limits), treat submodes as MAN until HW=MAN (Arduino software revert) */
+	bool submode_force_man;
 } els_menu_t;
 
 void els_menu_init(els_menu_t *m, lcd_hd44780_t *lcd, menu_keys_t *keys);
+/* Call after mode_port / submode_port / joy pins are assigned (avoids false INT/EXT edge). */
+void els_menu_pins_ready(els_menu_t *m);
 void els_menu_update(els_menu_t *m, uint32_t now_ms);
 void els_menu_render(els_menu_t *m);
 void els_menu_set_adc_raw10(els_menu_t *m, uint16_t adc10);

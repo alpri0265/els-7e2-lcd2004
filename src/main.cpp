@@ -56,7 +56,10 @@ static constexpr uint8_t BTN_STOP_PIN = PB13;
 // stored coordinates. Second press clears that limit. MECH_* = hardware trip (blocks all motion).
 // CubeMX names → teach function: PA11 LEFT / PA10 RIGHT = Z ends; PA9 FRONT / PA8 REAR = X ends.
 #define ENABLE_SOFTWARE_LIMITS 1
+#include "linear_encoders.h"
+
 #if ENABLE_SOFTWARE_LIMITS
+#include "els_afeed.h"
 static constexpr uint8_t TEACH_LIMIT_X_REAR_PIN = PA8;
 static constexpr uint8_t TEACH_LIMIT_X_FRONT_PIN = PA9;
 static constexpr uint8_t TEACH_LIMIT_Z_RIGHT_PIN = PA10;
@@ -67,9 +70,16 @@ static constexpr uint8_t LED_LIM_REAR_PIN  = PG12;  // X rear armed
 static constexpr uint8_t LED_LIM_FRONT_PIN = PG13;  // X front armed
 static constexpr uint8_t LED_LIM_RIGHT_PIN = PG14;  // Z right armed
 static constexpr uint8_t LED_LIM_LEFT_PIN  = PG15;  // Z left armed
-static constexpr int32_t LIMIT_TEACH_MARGIN_STEPS = 100;
 static constexpr int32_t MCSTEP_Z_SOFT = 2;
 static constexpr int32_t MCSTEP_X_SOFT = 4;
+/* Arduino Menu.ino Limit_*_Pressed: (MIN_RAPID_MOTION - MAX_RAPID_MOTION) * REPEAt * 2, REPEAt = McSTEP_Z */
+static constexpr int32_t ARDUINO_MAX_RAPID = 40;
+static constexpr int32_t ARDUINO_MIN_RAPID = ARDUINO_MAX_RAPID + 165;
+static constexpr int32_t ARDUINO_LIMIT_GAP_STEPS =
+    (ARDUINO_MIN_RAPID - ARDUINO_MAX_RAPID) * MCSTEP_Z_SOFT * 2;
+/* Мінімальний «коридор» між парними лімітами: оцінка шляху розгону+гальмування для поточної подачі (кроки). */
+static constexpr uint32_t LIMIT_ACCEL_DECEL_MS = 120;
+static constexpr uint16_t BEEP_LIMIT_REJECT_MS = 140;
 static int32_t motor_z_steps = 0;
 static int32_t motor_x_steps = 0;
 #endif
@@ -90,6 +100,18 @@ static constexpr uint8_t SCALE_X10_PIN  = PD6;
 
 // If X moves opposite to Z for the same encoder rotation, set to 1.
 static constexpr bool HAND_ENCODER_INVERT_X = false;
+
+// Spindle encoder: TIM3 quadrature PA6 (CH1) + PA7 (CH2), see docs/pinout.md ENC_SP_*
+#ifndef ENABLE_SPINDLE_ENCODER
+#define ENABLE_SPINDLE_ENCODER 1
+#endif
+#ifndef SPINDLE_QUAD_TICKS_PER_REV
+/* Повних імпульсів TIM3 за один оборот шпинделя (4× від ліній на диску). Приклад: 600 CPR → 2400. */
+#define SPINDLE_QUAD_TICKS_PER_REV 2400u
+#endif
+#ifndef SPINDLE_ENCODER_INVERT
+#define SPINDLE_ENCODER_INVERT 0
+#endif
 
 // Stepper driver outputs (CubeMX wiring)
 static constexpr uint8_t Z_STEP_PIN = PC0;
@@ -200,6 +222,11 @@ enum class HandAxisSel : uint8_t { None, Z, X };
 static HandAxisSel g_hand_axis_disp = HandAxisSel::None;
 static int16_t g_hand_cnt_disp = 0;
 static uint16_t g_hand_scale_mult_disp = 1;
+
+#if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
+static int16_t g_spindle_cnt_disp = 0;
+static uint16_t g_spindle_rpm_disp = 0;
+#endif
 
 static const char* modeName(Mode m)
 {
@@ -318,7 +345,11 @@ static void makeRow1(char out[21])
       snprintf(out, 21, "aFEED:%u.%02u mm/rev", feed_x100 / 100, feed_x100 % 100);
       break;
     case MODE_THREAD:
+#if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
+      snprintf(out, 21, "STEP:%u.%02u S:%6d", feed_x100 / 100, feed_x100 % 100, (int)g_spindle_cnt_disp);
+#else
       snprintf(out, 21, "STEP: %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
+#endif
       break;
     case MODE_CONE:
       snprintf(out, 21, "CONE: %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
@@ -327,7 +358,12 @@ static void makeRow1(char out[21])
       snprintf(out, 21, "R:    %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
       break;
     case MODE_TACHO:
+#if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
+      snprintf(out, 21, "RPM:%5u t/r%u", (unsigned)g_spindle_rpm_disp,
+               (unsigned)(SPINDLE_QUAD_TICKS_PER_REV > 9999 ? 9999 : SPINDLE_QUAD_TICKS_PER_REV));
+#else
       snprintf(out, 21, "RPM:  %u", (unsigned)(feed_x100 * 10));
+#endif
       break;
     case MODE_RESERVE:
       snprintf(out, 21, "RES:  %u", (unsigned)(feed_x100));
@@ -794,23 +830,114 @@ static void limitsInitPins()
   limitsLedsRefresh();
 }
 
-static bool joyZIdleForTeach()
+/* Навчання ліміту: джойстик повністю в нейтралі (IDLE), як у вимозі до «Електронної гітари». */
+static bool joyNeutralForTeach()
 {
-  const JoyDir d = debouncedJoystickDir();
-  return d != JoyDir::Left && d != JoyDir::Right;
+  return debouncedJoystickDir() == JoyDir::None;
 }
 
-static bool joyXIdleForTeach()
+/* Мінімальна відстань між парними лімітами (кроки) ≈ розгін + гальмування для поточної подачі. */
+static uint32_t limitMinCorridorStepsForFeed(bool forRapidSpeed)
 {
-  const JoyDir d = debouncedJoystickDir();
-  return d != JoyDir::Up && d != JoyDir::Down;
+  const uint32_t sps = feedToStepsPerSecond(feed_x100, forRapidSpeed);
+  uint32_t d = (sps * LIMIT_ACCEL_DECEL_MS) / 1000U;
+  if (d < (uint32_t)ARDUINO_LIMIT_GAP_STEPS) d = (uint32_t)ARDUINO_LIMIT_GAP_STEPS;
+  return d;
+}
+
+static uint32_t limitBrakeDistanceSteps()
+{
+  return limitMinCorridorStepsForFeed(true);
+}
+
+/* Чи достатній коридор між новою точкою та вже навченою протилежною межею. */
+static bool teachPairWideEnoughZ(int32_t candidatePos, bool teachingLeft)
+{
+  const uint32_t need = limitMinCorridorStepsForFeed(false);
+  if (teachingLeft) {
+    if (!limit_z_right_on) return true;
+    return (int64_t)limit_pos_z_right - (int64_t)candidatePos >= (int64_t)need;
+  }
+  if (!limit_z_left_on) return true;
+  return (int64_t)candidatePos - (int64_t)limit_pos_z_left >= (int64_t)need;
+}
+
+static bool teachPairWideEnoughX(int32_t candidatePos, bool teachingFront)
+{
+  const uint32_t need = limitMinCorridorStepsForFeed(false);
+  if (teachingFront) {
+    if (!limit_x_rear_on) return true;
+    return (int64_t)candidatePos - (int64_t)limit_pos_x_rear >= (int64_t)need;
+  }
+  if (!limit_x_front_on) return true;
+  return (int64_t)limit_pos_x_front - (int64_t)candidatePos >= (int64_t)need;
+}
+
+/* Ручний обхід програмних лімітів: підрежим MAN + утримання RAPID + рух джойстиком (примірка тощо). */
+static bool softLimitsJoyRapidOverrideActive()
+{
+  if (els_afeed::isBusy()) return false;
+  if (submode_per_mode[current_mode] != SUB_MAN) return false;
+  if (!rapid_enabled) return false;
+  return debouncedJoystickDir() != JoyDir::None;
+}
+
+static bool softLimitRapidAllowsZ(bool zDirTrue)
+{
+  if (!rapid_enabled) return true;
+  if (softLimitsJoyRapidOverrideActive()) return true;
+  const uint32_t marg = limitBrakeDistanceSteps();
+  if (zDirTrue && limit_z_right_on) {
+    if ((int64_t)limit_pos_z_right - (int64_t)motor_z_steps <= (int64_t)marg) return false;
+  }
+  if (!zDirTrue && limit_z_left_on) {
+    if ((int64_t)motor_z_steps - (int64_t)limit_pos_z_left <= (int64_t)marg) return false;
+  }
+  return true;
+}
+
+static bool softLimitRapidAllowsX(bool xDirTrue)
+{
+  if (!rapid_enabled) return true;
+  if (softLimitsJoyRapidOverrideActive()) return true;
+  const uint32_t marg = limitBrakeDistanceSteps();
+  if (xDirTrue && limit_x_front_on) {
+    if ((int64_t)limit_pos_x_front - (int64_t)motor_x_steps <= (int64_t)marg) return false;
+  }
+  if (!xDirTrue && limit_x_rear_on) {
+    if ((int64_t)motor_x_steps - (int64_t)limit_pos_x_rear <= (int64_t)marg) return false;
+  }
+  return true;
+}
+
+/* Arduino Menu.ino: teach only in Thread/Feed/aFeed/Cone/Sphere + submode MAN (B10100000 on Mega). */
+static bool limitTeachArduinoContextOk()
+{
+  if (els_afeed::isBusy()) return false;
+  /* Джойстик перевіряється в joy*IdleForTeach(); не використовуємо jogZ.enabled — інакше teach
+   * іноді «ніколи» не проходить між кроками / порядком виклику в loop(). */
+  switch (current_mode) {
+    case MODE_FEED:
+    case MODE_AFEED:
+    case MODE_THREAD:
+    case MODE_CONE:
+    case MODE_SPHERE:
+      break;
+    default:
+      return false;
+  }
+  return submode_per_mode[current_mode] == SUB_MAN;
 }
 
 static void teachLimitZLeft()
 {
-  if (!joyZIdleForTeach()) return;
+  if (!limitTeachArduinoContextOk()) return;
+  if (!joyNeutralForTeach()) return;
   if (!limit_z_left_on) {
-    if (limit_z_right_on && motor_z_steps <= limit_pos_z_right + LIMIT_TEACH_MARGIN_STEPS) return;
+    if (!teachPairWideEnoughZ(motor_z_steps, true)) {
+      beeperTrigger(BEEP_LIMIT_REJECT_MS);
+      return;
+    }
     limit_pos_z_left = alignToMcStep(motor_z_steps, MCSTEP_Z_SOFT);
     limit_z_left_on = true;
   } else {
@@ -824,9 +951,13 @@ static void teachLimitZLeft()
 
 static void teachLimitZRight()
 {
-  if (!joyZIdleForTeach()) return;
+  if (!limitTeachArduinoContextOk()) return;
+  if (!joyNeutralForTeach()) return;
   if (!limit_z_right_on) {
-    if (limit_z_left_on && motor_z_steps >= limit_pos_z_left - LIMIT_TEACH_MARGIN_STEPS) return;
+    if (!teachPairWideEnoughZ(motor_z_steps, false)) {
+      beeperTrigger(BEEP_LIMIT_REJECT_MS);
+      return;
+    }
     limit_pos_z_right = alignToMcStep(motor_z_steps, MCSTEP_Z_SOFT);
     limit_z_right_on = true;
   } else {
@@ -840,9 +971,13 @@ static void teachLimitZRight()
 
 static void teachLimitXFront()
 {
-  if (!joyXIdleForTeach()) return;
+  if (!limitTeachArduinoContextOk()) return;
+  if (!joyNeutralForTeach()) return;
   if (!limit_x_front_on) {
-    if (limit_x_rear_on && motor_x_steps <= limit_pos_x_rear + LIMIT_TEACH_MARGIN_STEPS) return;
+    if (!teachPairWideEnoughX(motor_x_steps, true)) {
+      beeperTrigger(BEEP_LIMIT_REJECT_MS);
+      return;
+    }
     limit_pos_x_front = alignToMcStep(motor_x_steps, MCSTEP_X_SOFT);
     limit_x_front_on = true;
   } else {
@@ -856,9 +991,13 @@ static void teachLimitXFront()
 
 static void teachLimitXRear()
 {
-  if (!joyXIdleForTeach()) return;
+  if (!limitTeachArduinoContextOk()) return;
+  if (!joyNeutralForTeach()) return;
   if (!limit_x_rear_on) {
-    if (limit_x_front_on && motor_x_steps >= limit_pos_x_front - LIMIT_TEACH_MARGIN_STEPS) return;
+    if (!teachPairWideEnoughX(motor_x_steps, false)) {
+      beeperTrigger(BEEP_LIMIT_REJECT_MS);
+      return;
+    }
     limit_pos_x_rear = alignToMcStep(motor_x_steps, MCSTEP_X_SOFT);
     limit_x_rear_on = true;
   } else {
@@ -922,16 +1061,35 @@ static bool limitsMechTrip()
 static bool softLimitAllowsZ(bool zDirTrue)
 {
   if (limitsMechTrip()) return false;
-  if (zDirTrue && limit_z_right_on && motor_z_steps >= limit_pos_z_right) return false;
-  if (!zDirTrue && limit_z_left_on && motor_z_steps <= limit_pos_z_left) return false;
+  if (softLimitsJoyRapidOverrideActive()) return true;
+  int32_t cap_l = limit_z_left_on ? limit_pos_z_left : kLimitPosMin;
+  int32_t cap_r = limit_z_right_on ? limit_pos_z_right : kLimitPosMax;
+  int32_t adj_l = cap_l;
+  int32_t adj_r = cap_r;
+  if (limit_z_left_on && limit_z_right_on
+      && els_afeed::adjustSoftZ(limit_pos_z_left, limit_pos_z_right, &adj_l, &adj_r)) {
+    cap_l = adj_l;
+    cap_r = adj_r;
+  }
+  if (zDirTrue && limit_z_right_on && motor_z_steps >= cap_r) return false;
+  if (!zDirTrue && limit_z_left_on && motor_z_steps <= cap_l) return false;
   return true;
 }
 
 static bool softLimitAllowsX(bool xDirTrue)
 {
   if (limitsMechTrip()) return false;
-  if (xDirTrue && limit_x_front_on && motor_x_steps >= limit_pos_x_front) return false;
-  if (!xDirTrue && limit_x_rear_on && motor_x_steps <= limit_pos_x_rear) return false;
+  if (softLimitsJoyRapidOverrideActive()) return true;
+  int32_t cap_f = limit_x_front_on ? limit_pos_x_front : kLimitPosMax;
+  int32_t cap_r = limit_x_rear_on ? limit_pos_x_rear : kLimitPosMin;
+  int32_t adj_f = cap_f;
+  int32_t adj_r = cap_r;
+  if (els_afeed::adjustSoftX(cap_f, cap_r, &adj_f, &adj_r)) {
+    cap_f = adj_f;
+    cap_r = adj_r;
+  }
+  if (xDirTrue && limit_x_front_on && motor_x_steps >= cap_f) return false;
+  if (!xDirTrue && limit_x_rear_on && motor_x_steps <= cap_r) return false;
   return true;
 }
 #else
@@ -1010,6 +1168,44 @@ static void handEncoderHwInit()
   s_hand_enc_last = 0;
 }
 
+#if ENABLE_SPINDLE_ENCODER
+static void spindleEncoderHwInit()
+{
+  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM3);
+  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+
+  LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_6 | LL_GPIO_PIN_7, LL_GPIO_MODE_ALTERNATE);
+  LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_6, LL_GPIO_AF_2);
+  LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_7, LL_GPIO_AF_2);
+  LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_6 | LL_GPIO_PIN_7, LL_GPIO_SPEED_FREQ_HIGH);
+  LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_6 | LL_GPIO_PIN_7, LL_GPIO_PULL_UP);
+
+  LL_TIM_InitTypeDef tim3 = {};
+  tim3.Prescaler = 0;
+  tim3.CounterMode = LL_TIM_COUNTERMODE_UP;
+  tim3.Autoreload = 0xFFFF;
+  tim3.ClockDivision = LL_TIM_CLOCKDIVISION_DIV1;
+  LL_TIM_Init(TIM3, &tim3);
+
+  LL_TIM_ENCODER_InitTypeDef enc3 = {};
+  enc3.EncoderMode = LL_TIM_ENCODERMODE_X4_TI12;
+  enc3.IC1Polarity = LL_TIM_IC_POLARITY_RISING;
+  enc3.IC1ActiveInput = LL_TIM_ACTIVEINPUT_DIRECTTI;
+  enc3.IC1Prescaler = LL_TIM_ICPSC_DIV1;
+  enc3.IC1Filter = 0x6;
+  enc3.IC2Polarity = LL_TIM_IC_POLARITY_RISING;
+  enc3.IC2ActiveInput = LL_TIM_ACTIVEINPUT_DIRECTTI;
+  enc3.IC2Prescaler = LL_TIM_ICPSC_DIV1;
+  enc3.IC2Filter = 0x6;
+  LL_TIM_ENCODER_Init(TIM3, &enc3);
+
+  LL_TIM_SetCounter(TIM3, 0);
+  LL_TIM_EnableCounter(TIM3);
+}
+#else
+static void spindleEncoderHwInit() {}
+#endif
+
 static int16_t handEncoderReadDelta()
 {
   const uint16_t c = LL_TIM_GetCounter(TIM4);
@@ -1020,6 +1216,7 @@ static int16_t handEncoderReadDelta()
 #else
 static void handEncoderHwInit() {}
 static int16_t handEncoderReadDelta() { return 0; }
+static void spindleEncoderHwInit() {}
 #endif
 
 static HandAxisSel readHandAxisDebounced()
@@ -1084,6 +1281,15 @@ static void updateHandWheelJog()
     return;
   }
 
+#if ENABLE_SOFTWARE_LIMITS
+  if (els_afeed::isBusy()) {
+    hand_q_steps = 0;
+    hand_q_axis = HandAxisSel::None;
+    hand_next_us = 0;
+    return;
+  }
+#endif
+
   if (joy_dir != JoyDir::None) {
     hand_q_steps = 0;
     hand_q_axis = HandAxisSel::None;
@@ -1108,13 +1314,7 @@ static void updateHandWheelJog()
       hand_q_steps = 0;
     }
     hand_q_axis = ax;
-    if (ax == HandAxisSel::Z) {
-      if (add > 0 && !softLimitAllowsZ(true)) add = 0;
-      if (add < 0 && !softLimitAllowsZ(false)) add = 0;
-    } else {
-      if (add > 0 && !softLimitAllowsX(true)) add = 0;
-      if (add < 0 && !softLimitAllowsX(false)) add = 0;
-    }
+    /* РГИ / електронний маховик: ігноруємо програмні ліміти (вимір, виїзд за упор). */
     hand_q_steps += add;
   }
 
@@ -1124,19 +1324,6 @@ static void updateHandWheelJog()
   }
 
   const bool forward = hand_q_steps > 0;
-  if (hand_q_axis == HandAxisSel::Z) {
-    if (!softLimitAllowsZ(forward)) {
-      hand_q_steps = 0;
-      hand_next_us = 0;
-      return;
-    }
-  } else {
-    if (!softLimitAllowsX(forward)) {
-      hand_q_steps = 0;
-      hand_next_us = 0;
-      return;
-    }
-  }
 
   // Min. interval from *real* time after each pulse. Slower at ×10 / ×100 so the motor
   // keeps up (burst "catch-up" with the old scheduler could fire dozens of steps ~20µs
@@ -1182,14 +1369,104 @@ static void handEncoderUiSnapshot()
   }
 }
 
+static void spindleEncoderUiSnapshot()
+{
+#if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
+  const uint16_t c = (uint16_t)LL_TIM_GetCounter(TIM3);
+#if SPINDLE_ENCODER_INVERT
+  g_spindle_cnt_disp = (int16_t)-(int16_t)c;
+#else
+  g_spindle_cnt_disp = (int16_t)c;
+#endif
+
+  static uint16_t s_sp_prev = 0;
+  static bool s_sp_have_prev = false;
+  static int32_t s_sp_acc = 0;
+  static uint32_t s_sp_t0 = 0;
+  static int16_t s_last_sp_cnt = 0x7fff;
+  static uint16_t s_last_sp_rpm = 0xffff;
+
+  if (!s_sp_have_prev) {
+    s_sp_prev = c;
+    s_sp_have_prev = true;
+    s_sp_t0 = millis();
+    s_sp_acc = 0;
+    return;
+  }
+
+  int16_t d = (int16_t)(c - s_sp_prev);
+#if SPINDLE_ENCODER_INVERT
+  d = (int16_t)-d;
+#endif
+  s_sp_prev = c;
+  s_sp_acc += (int32_t)d;
+
+  const uint32_t m = millis();
+  const uint32_t dt = m - s_sp_t0;
+  if (dt >= 200u) {
+    const int64_t acc_abs = s_sp_acc >= 0 ? (int64_t)s_sp_acc : -(int64_t)s_sp_acc;
+    uint32_t rpm = 0;
+    if (SPINDLE_QUAD_TICKS_PER_REV > 0u && dt > 0u)
+      rpm = (uint32_t)((acc_abs * 60000ULL) / (uint64_t)SPINDLE_QUAD_TICKS_PER_REV / (uint64_t)dt);
+    if (rpm > 9999u) rpm = 9999u;
+    g_spindle_rpm_disp = (uint16_t)rpm;
+    s_sp_acc = 0;
+    s_sp_t0 = m;
+  }
+
+  if ((current_mode == MODE_THREAD || current_mode == MODE_TACHO) &&
+      (g_spindle_cnt_disp != s_last_sp_cnt || g_spindle_rpm_disp != s_last_sp_rpm)) {
+    s_last_sp_cnt = g_spindle_cnt_disp;
+    s_last_sp_rpm = g_spindle_rpm_disp;
+    cache_valid = false;
+  }
+#else
+  (void)0;
+#endif
+}
+
+#if ENABLE_SOFTWARE_LIMITS
+static uint8_t joyDirToAfeedJoy(JoyDir d)
+{
+  switch (d) {
+    case JoyDir::Left: return 1;
+    case JoyDir::Right: return 2;
+    case JoyDir::Up: return 3;
+    case JoyDir::Down: return 4;
+    default: return 0;
+  }
+}
+#endif
+
 static void updateStepperJog()
 {
-  const uint32_t sps = feedToStepsPerSecond(feed_x100, rapid_enabled);
-  const uint32_t intervalUs = (sps == 0) ? 0 : (1000000UL / sps);
-
   // Keep motion direction in sync with debounced joystick reading.
   // NOTE: updateJoystickMainStyle() only runs on *changes*; stepper must use the latest stable direction.
   joy_dir = debouncedJoystickDir();
+
+#if ENABLE_SOFTWARE_LIMITS
+  bool awz = false, awx = false, aZd = false, aXd = false, zrap = false, xrap = false;
+  const uint32_t spsFeedOnly = feedToStepsPerSecond(feed_x100, false);
+  const uint32_t intervalUs = (spsFeedOnly == 0) ? 0 : (1000000UL / spsFeedOnly);
+  const uint32_t spsRapOnly = feedToStepsPerSecond(feed_x100, true);
+  const uint32_t intervalRapidUs = (spsRapOnly == 0) ? 0 : (1000000UL / spsRapOnly);
+  const uint32_t afeedIvFeed = (intervalUs == 0) ? 400U : intervalUs;
+  const uint32_t afeedIvRap = (intervalRapidUs == 0) ? 200U : intervalRapidUs;
+  if (els_afeed::driveJog(motor_z_steps, motor_x_steps, current_mode == MODE_AFEED,
+                          (uint8_t)submode_per_mode[current_mode], joyDirToAfeedJoy(joy_dir),
+                          limit_z_left_on, limit_z_right_on, limit_x_front_on, limit_x_rear_on,
+                          limit_pos_z_left, limit_pos_z_right, limit_pos_x_front, limit_pos_x_rear, doc_x100,
+                          feed_x100, &pass_cur, pass_total, afeedIvFeed, afeedIvRap, &awz, &aZd, &awx,
+                          &aXd, &zrap, &xrap)) {
+    const uint32_t zIv = (zrap && afeedIvRap > 0) ? afeedIvRap : afeedIvFeed;
+    const uint32_t xIv = (xrap && afeedIvRap > 0) ? afeedIvRap : afeedIvFeed;
+    jogUpdate(jogZ, awz, aZd, zIv);
+    jogUpdate(jogX, awx, aXd, xIv);
+    cache_valid = false;
+    updateHandWheelJog();
+    return;
+  }
+#endif
 
   // Decide which axis/direction is requested by joystick
   bool wantZ = false, wantX = false;
@@ -1200,19 +1477,59 @@ static void updateStepperJog()
     wantX = false;
   }
 
+  /* aFEED INT/EXT: Left/Right = выбор ветви цикла (как Arduino), не ручной Z — иначе «авто X» не видно. */
+#if ENABLE_SOFTWARE_LIMITS
+  const bool afeed_lr_reserved = els_afeed::joystickLeftRightReservedForAfeed(
+      current_mode == MODE_AFEED, (uint8_t)submode_per_mode[current_mode], doc_x100, limit_z_left_on,
+      limit_z_right_on, limit_x_front_on, limit_x_rear_on);
+  const bool afeed_ext_ud_reserved = els_afeed::joystickExtUdReservedForAfeed(
+      current_mode == MODE_AFEED, (uint8_t)submode_per_mode[current_mode], limit_z_left_on,
+      limit_z_right_on, limit_x_front_on, limit_x_rear_on);
+#else
+  const bool afeed_lr_reserved = false;
+  const bool afeed_ext_ud_reserved = false;
+#endif
+
   switch (joy_dir) {
-    case JoyDir::Left:  wantZ = true; zDir = false; break;
-    case JoyDir::Right: wantZ = true; zDir = true;  break;
-    case JoyDir::Up:    wantX = true; xDir = true;  break;
-    case JoyDir::Down:  wantX = true; xDir = false; break;
+    case JoyDir::Left:
+      if (!afeed_lr_reserved) {
+        wantZ = true;
+        zDir = false;
+      }
+      break;
+    case JoyDir::Right:
+      if (!afeed_lr_reserved) {
+        wantZ = true;
+        zDir = true;
+      }
+      break;
+    case JoyDir::Up:
+      if (!afeed_ext_ud_reserved) {
+        wantX = true;
+        xDir = true;
+      }
+      break;
+    case JoyDir::Down:
+      if (!afeed_ext_ud_reserved) {
+        wantX = true;
+        xDir = false;
+      }
+      break;
     case JoyDir::None:  default: break;
   }
 
   if (wantZ && !softLimitAllowsZ(zDir)) wantZ = false;
   if (wantX && !softLimitAllowsX(xDir)) wantX = false;
 
-  jogUpdate(jogZ, wantZ, zDir, intervalUs);
-  jogUpdate(jogX, wantX, xDir, intervalUs);
+  const bool rapidZ = rapid_enabled && (!wantZ || softLimitRapidAllowsZ(zDir));
+  const bool rapidX = rapid_enabled && (!wantX || softLimitRapidAllowsX(xDir));
+  const uint32_t spsZ = feedToStepsPerSecond(feed_x100, rapidZ);
+  const uint32_t spsX = feedToStepsPerSecond(feed_x100, rapidX);
+  const uint32_t intervalZ = (spsZ == 0) ? 0 : (1000000UL / spsZ);
+  const uint32_t intervalX = (spsX == 0) ? 0 : (1000000UL / spsX);
+
+  jogUpdate(jogZ, wantZ, zDir, intervalZ);
+  jogUpdate(jogX, wantX, xDir, intervalX);
 
   updateHandWheelJog();
 }
@@ -1611,6 +1928,21 @@ void setup()
   pinMode(SCALE_X10_PIN, INPUT_PULLUP);
 
   handEncoderHwInit();
+  spindleEncoderHwInit();
+
+#if defined(STM32F407xx) && ENABLE_LINEAR_ENCODERS
+  linearEncodersInit(
+      []() {
+        motor_z_steps = 0;
+        beeperTrigger(BEEP_MS);
+      },
+      []() {
+        motor_x_steps = 0;
+        beeperTrigger(BEEP_MS);
+      });
+#else
+  linearEncodersInit(nullptr, nullptr);
+#endif
 
   delay(5);
 
@@ -1620,7 +1952,9 @@ void setup()
 
 void loop()
 {
+  linearEncodersPoll();
   handEncoderUiSnapshot();
+  spindleEncoderUiSnapshot();
   updateSoftwareLimits();
 
   updateJoystickMainStyle();

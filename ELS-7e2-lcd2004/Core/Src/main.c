@@ -144,6 +144,8 @@ int main(void)
   g_menu.joy_pin_u = JOY_U_Pin;
   g_menu.joy_pin_d = JOY_D_Pin;
 
+  els_menu_pins_ready(&g_menu);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -718,6 +720,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LIM_MECH_1_Pin LIM_MECH_2_Pin */
+  GPIO_InitStruct.Pin = LIM_MECH_1_Pin|LIM_MECH_2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(LIM_MECH_1_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : JOY_L_Pin JOY_R_Pin JOY_U_Pin JOY_D_Pin */
   GPIO_InitStruct.Pin = JOY_L_Pin|JOY_R_Pin|JOY_U_Pin|JOY_D_Pin;
