@@ -35,6 +35,9 @@ static constexpr uint8_t BTN_UP    = PB10;
 static constexpr uint8_t BTN_DOWN  = PB11;
 static constexpr uint8_t BTN_SEL   = PB12;
 
+static uint32_t lastKeyTime = 0;
+static const uint32_t KEY_PERIOD = 5; // мс, аналог Timer1 в Arduino
+
 // Joystick (CubeMX wiring): active LOW with pull-ups
 static constexpr uint8_t JOY_L_PIN = PF12;
 static constexpr uint8_t JOY_R_PIN = PF13;
@@ -112,6 +115,10 @@ static constexpr bool HAND_ENCODER_INVERT_X = false;
 #ifndef SPINDLE_ENCODER_INVERT
 #define SPINDLE_ENCODER_INVERT 0
 #endif
+
+volatile int32_t spindle_pos = 0;
+volatile int32_t last_spindle_pos = 0;
+volatile bool spindle_step_flag = false;
 
 // Stepper driver outputs (CubeMX wiring)
 static constexpr uint8_t Z_STEP_PIN = PC0;
@@ -1379,7 +1386,7 @@ static void spindleEncoderUiSnapshot()
   g_spindle_cnt_disp = (int16_t)c;
 #endif
 
-  static uint16_t s_sp_prev = 0;
+  static uint16_t prev = 0;
   static bool s_sp_have_prev = false;
   static int32_t s_sp_acc = 0;
   static uint32_t s_sp_t0 = 0;
@@ -1387,19 +1394,31 @@ static void spindleEncoderUiSnapshot()
   static uint16_t s_last_sp_rpm = 0xffff;
 
   if (!s_sp_have_prev) {
-    s_sp_prev = c;
+    prev = c;
     s_sp_have_prev = true;
     s_sp_t0 = millis();
     s_sp_acc = 0;
     return;
   }
 
-  int16_t d = (int16_t)(c - s_sp_prev);
+  int16_t delta = (int16_t)(c - prev);
+  prev = c;
 #if SPINDLE_ENCODER_INVERT
-  d = (int16_t)-d;
+  delta = (int16_t)-delta;
 #endif
-  s_sp_prev = c;
-  s_sp_acc += (int32_t)d;
+  spindle_pos += (int32_t)delta;
+  if (spindle_pos >= (int32_t)SPINDLE_QUAD_TICKS_PER_REV)
+    spindle_pos = 0;
+  else if (spindle_pos < 0)
+    spindle_pos = (int32_t)SPINDLE_QUAD_TICKS_PER_REV - 1;
+
+  if (spindle_pos != last_spindle_pos)
+  {
+    spindle_step_flag = true;
+    last_spindle_pos = spindle_pos;
+  }
+
+  s_sp_acc += (int32_t)delta;
 
   const uint32_t m = millis();
   const uint32_t dt = m - s_sp_t0;
@@ -1440,6 +1459,14 @@ static uint8_t joyDirToAfeedJoy(JoyDir d)
 
 static void updateStepperJog()
 {
+  if (current_mode == MODE_THREAD || current_mode == MODE_FEED)
+  {
+    if (!spindle_step_flag)
+      return;
+
+    spindle_step_flag = false;
+  }
+
   // Keep motion direction in sync with debounced joystick reading.
   // NOTE: updateJoystickMainStyle() only runs on *changes*; stepper must use the latest stable direction.
   joy_dir = debouncedJoystickDir();
@@ -1962,6 +1989,10 @@ void loop()
   updateRapidButton();
   updateFeedFromPot();
   updateStepperJog();
-  updateButtonsDebounced();
+  if (millis() - lastKeyTime >= KEY_PERIOD)
+  {
+    lastKeyTime = millis();
+    updateButtonsDebounced();
+  }
   updateBeeper();
 }
