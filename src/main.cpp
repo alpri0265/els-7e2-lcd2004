@@ -1541,9 +1541,9 @@ static bool motionInhibited()
 #ifndef HAND_ENC_INVERT
 #define HAND_ENC_INVERT 0
 #endif
-/* Сирих переходів квадратури на один механічний щелчок (EC11 у режимі «всі фронти» ≈ 4). 2 — деякі енкодери. */
-#ifndef HAND_ENCODER_RAW_PER_STEP
-#define HAND_ENCODER_RAW_PER_STEP 4
+/* Лише для LCD: сирих переходів на один відображуваний «щелчок» (≈4 для EC11). Мотор завжди отримує повну квадратуру. */
+#ifndef HAND_ENCODER_DISPLAY_RAW_PER_DETENT
+#define HAND_ENCODER_DISPLAY_RAW_PER_DETENT 4
 #endif
 
 static int32_t handEncoderFloorDiv(int32_t a, int32_t b)
@@ -1553,20 +1553,18 @@ static int32_t handEncoderFloorDiv(int32_t a, int32_t b)
   return -((-a + b - 1) / b);
 }
 
-static int32_t handEncoderStepsFromRaw(int32_t raw)
+static int32_t handEncoderDisplayDetents(int32_t raw)
 {
-  const int32_t k = (int32_t)HAND_ENCODER_RAW_PER_STEP;
+  const int32_t k = (int32_t)HAND_ENCODER_DISPLAY_RAW_PER_DETENT;
   if (k <= 1) return raw;
   return handEncoderFloorDiv(raw, k);
 }
-
-/* Позиція в «кроках» (щелчках), узгоджена з handEncoderReadDelta. */
-static int32_t s_hand_step_emitted;
 
 #if HAND_ENCODER_SOFTWARE_QUAD
 static const int8_t kHandQuad[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
 static uint8_t s_hand_prev_ab;
 static int32_t s_hand_quad_total;
+static int32_t s_hand_quad_read_last;
 
 static uint8_t handEncoderReadAB()
 {
@@ -1590,6 +1588,7 @@ static void handEncoderPollQuad()
 #else
 static uint16_t s_hand_tim4_last = 0;
 static int32_t s_hand_tim4_raw_accum = 0;
+static int32_t s_hand_tim4_read_last;
 static void handEncoderPollQuad()
 {
   const uint16_t c = LL_TIM_GetCounter(TIM4);
@@ -1610,7 +1609,7 @@ static void handEncoderHwInit()
   pinMode(ENC_HC_B_PIN, INPUT_PULLUP);
   s_hand_prev_ab = handEncoderReadAB();
   s_hand_quad_total = 0;
-  s_hand_step_emitted = 0;
+  s_hand_quad_read_last = 0;
 #else
   LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM4);
 
@@ -1643,7 +1642,7 @@ static void handEncoderHwInit()
   LL_TIM_EnableCounter(TIM4);
   s_hand_tim4_last = LL_TIM_GetCounter(TIM4);
   s_hand_tim4_raw_accum = 0;
-  s_hand_step_emitted = 0;
+  s_hand_tim4_read_last = 0;
 #endif
 }
 
@@ -1688,16 +1687,15 @@ static void spindleEncoderHwInit() {}
 static int16_t handEncoderReadDelta()
 {
   handEncoderPollQuad();
-  int32_t raw;
 #if HAND_ENCODER_SOFTWARE_QUAD
-  raw = s_hand_quad_total;
+  const int32_t t = s_hand_quad_total;
+  int32_t d = t - s_hand_quad_read_last;
+  s_hand_quad_read_last = t;
 #else
-  raw = s_hand_tim4_raw_accum;
+  const int32_t t = s_hand_tim4_raw_accum;
+  int32_t d = t - s_hand_tim4_read_last;
+  s_hand_tim4_read_last = t;
 #endif
-
-  const int32_t steps_now = handEncoderStepsFromRaw(raw);
-  int32_t d = steps_now - s_hand_step_emitted;
-  s_hand_step_emitted = steps_now;
   if (d > 32767) d = 32767;
   if (d < -32768) d = -32768;
   return (int16_t)d;
@@ -1843,9 +1841,9 @@ static void handEncoderUiSnapshot()
 #if defined(STM32F407xx)
   handEncoderPollQuad();
 #if HAND_ENCODER_SOFTWARE_QUAD
-  g_hand_cnt_disp = (uint16_t)((uint32_t)handEncoderStepsFromRaw(s_hand_quad_total) & 0xFFFFu);
+  g_hand_cnt_disp = (uint16_t)((uint32_t)handEncoderDisplayDetents(s_hand_quad_total) & 0xFFFFu);
 #else
-  g_hand_cnt_disp = (uint16_t)((uint32_t)handEncoderStepsFromRaw(s_hand_tim4_raw_accum) & 0xFFFFu);
+  g_hand_cnt_disp = (uint16_t)((uint32_t)handEncoderDisplayDetents(s_hand_tim4_raw_accum) & 0xFFFFu);
 #endif
 #else
   g_hand_cnt_disp = 0;
@@ -1969,17 +1967,17 @@ static uint32_t manAfeedZShuttleSps(uint16_t fx100)
 
 static void updateStepperJog()
 {
-  if (current_mode == MODE_THREAD || current_mode == MODE_FEED)
-  {
-    if (!spindle_step_flag)
-      return;
+  // Keep motion direction in sync with debounced joystick reading (потрібно і для раннього return).
+  joy_dir = debouncedJoystickDir();
 
+  /* Джойстик у FEED/THREAD прив'язаний до кроку шпинделя; ручне колесо (РГІ) — ні: інакше при ×1 «нема руху». */
+  if (current_mode == MODE_THREAD || current_mode == MODE_FEED) {
+    if (!spindle_step_flag) {
+      updateHandWheelJog();
+      return;
+    }
     spindle_step_flag = false;
   }
-
-  // Keep motion direction in sync with debounced joystick reading.
-  // NOTE: updateJoystickMainStyle() only runs on *changes*; stepper must use the latest stable direction.
-  joy_dir = debouncedJoystickDir();
 
 #if ENABLE_SOFTWARE_LIMITS
   const bool afeed_man =
