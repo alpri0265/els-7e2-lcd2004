@@ -3,6 +3,13 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
+#if __has_include(<EEPROM.h>)
+#include <EEPROM.h>
+#define HAVE_EEPROM 1
+#else
+#define HAVE_EEPROM 0
+#endif
+
 #if defined(STM32F407xx)
 #include "stm32f4xx_ll_bus.h"
 #include "stm32f4xx_ll_gpio.h"
@@ -76,11 +83,6 @@ static constexpr uint8_t LED_LIM_RIGHT_PIN = PG14;  // Z right armed
 static constexpr uint8_t LED_LIM_LEFT_PIN  = PG15;  // Z left armed
 static constexpr int32_t MCSTEP_Z_SOFT = 2;
 static constexpr int32_t MCSTEP_X_SOFT = 4;
-/* Arduino Menu.ino Limit_*_Pressed: (MIN_RAPID_MOTION - MAX_RAPID_MOTION) * REPEAt * 2, REPEAt = McSTEP_Z */
-static constexpr int32_t ARDUINO_MAX_RAPID = 40;
-static constexpr int32_t ARDUINO_MIN_RAPID = ARDUINO_MAX_RAPID + 165;
-static constexpr int32_t ARDUINO_LIMIT_GAP_STEPS =
-    (ARDUINO_MIN_RAPID - ARDUINO_MAX_RAPID) * MCSTEP_Z_SOFT * 2;
 /* Мінімальний «коридор» між парними лімітами: оцінка шляху розгону+гальмування для поточної подачі (кроки). */
 static constexpr uint32_t LIMIT_ACCEL_DECEL_MS = 120;
 static constexpr uint16_t BEEP_LIMIT_REJECT_MS = 140;
@@ -93,7 +95,7 @@ static constexpr uint8_t ADC_FEED_PIN = PF6;
 
 static constexpr uint8_t BEEPER_PIN = PD0;
 
-// Hand wheel: TIM4 quadrature on PD12 (CH1) + PD13 (CH2). After handEncoderHwInit() do not pinMode these.
+// Hand wheel: PD12 (A) + PD13 (B). За замовчуванням — програмна квадратура (див. HAND_ENCODER_SOFTWARE_QUAD).
 static constexpr uint8_t ENC_HC_A_PIN = PD12;
 static constexpr uint8_t ENC_HC_B_PIN = PD13;
 static constexpr uint8_t AXIS_Z_PIN   = PD11;
@@ -116,6 +118,184 @@ static constexpr bool HAND_ENCODER_INVERT_X = false;
 #ifndef SPINDLE_ENCODER_INVERT
 #define SPINDLE_ENCODER_INVERT 0
 #endif
+
+struct HwSettings
+{
+  uint32_t magic;
+  uint16_t version;
+  uint16_t crc;
+
+  uint16_t enc_lines_per_rev;
+  uint16_t motor_z_steps_per_rev;
+  uint16_t screw_z_hundredths;
+  uint8_t mcstep_z;
+
+  uint16_t motor_x_steps_per_rev;
+  uint16_t screw_x_hundredths;
+  uint16_t rebound_x;
+  uint16_t rebound_z;
+  uint8_t mcstep_x;
+
+  uint8_t thrd_accel;
+  uint8_t feed_accel;
+  uint8_t min_feed;
+  uint8_t max_feed;
+  uint16_t min_afeed;
+  uint16_t max_afeed;
+  uint8_t excess_lag;
+  uint8_t pass_finish;
+  uint16_t tacho_th;
+
+  uint8_t max_rapid_motion;
+  uint8_t rapid_span;
+
+  uint8_t hc_scale_1;
+  uint8_t hc_scale_10;
+  uint16_t hc_start_speed_1;
+  uint16_t hc_max_speed_1;
+  uint16_t hc_start_speed_10;
+  uint16_t hc_max_speed_10;
+  uint8_t hc_x_dir;
+};
+
+static constexpr uint32_t kHwMagic = 0x32453745u;
+static constexpr uint16_t kHwVersion = 1u;
+
+static HwSettings g_hw = {
+    kHwMagic,
+    kHwVersion,
+    0,
+    1800,
+    1000,
+    400,
+    2,
+    300,
+    150,
+    1500,
+    1500,
+    4,
+    60,
+    2,
+    2,
+    25,
+    20,
+    250,
+    2,
+    1,
+    13300,
+    40,
+    165,
+    1,
+    10,
+    250,
+    150,
+    150,
+    23,
+    1,
+};
+
+static bool g_hw_dirty = false;
+static uint32_t g_hw_saved_banner_until_ms = 0;
+static uint32_t g_spindle_ticks_per_rev = SPINDLE_QUAD_TICKS_PER_REV;
+static bool g_hand_encoder_invert_x = false;
+static uint32_t g_limit_gap_steps = 0;
+
+static uint16_t crc16_ccitt(const uint8_t* data, size_t len)
+{
+  uint16_t crc = 0xFFFFu;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t b = 0; b < 8; b++) {
+      crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+static void hwApplyDerived()
+{
+  g_spindle_ticks_per_rev = (uint32_t)g_hw.enc_lines_per_rev * 4u;
+  if (g_spindle_ticks_per_rev == 0u) g_spindle_ticks_per_rev = 1u;
+  g_hand_encoder_invert_x = (g_hw.hc_x_dir != 0u);
+  g_limit_gap_steps = (uint32_t)((uint32_t)g_hw.rapid_span * (uint32_t)MCSTEP_Z_SOFT * 2u);
+}
+
+static void hwClamp()
+{
+  if (g_hw.enc_lines_per_rev < 1) g_hw.enc_lines_per_rev = 1;
+  if (g_hw.enc_lines_per_rev > 10000) g_hw.enc_lines_per_rev = 10000;
+
+  if (g_hw.motor_z_steps_per_rev < 1) g_hw.motor_z_steps_per_rev = 1;
+  if (g_hw.motor_z_steps_per_rev > 40000) g_hw.motor_z_steps_per_rev = 40000;
+  if (g_hw.screw_z_hundredths < 1) g_hw.screw_z_hundredths = 1;
+  if (g_hw.screw_z_hundredths > 5000) g_hw.screw_z_hundredths = 5000;
+  if (g_hw.mcstep_z < 1) g_hw.mcstep_z = 1;
+  if (g_hw.mcstep_z > 128) g_hw.mcstep_z = 128;
+
+  if (g_hw.motor_x_steps_per_rev < 1) g_hw.motor_x_steps_per_rev = 1;
+  if (g_hw.motor_x_steps_per_rev > 40000) g_hw.motor_x_steps_per_rev = 40000;
+  if (g_hw.screw_x_hundredths < 1) g_hw.screw_x_hundredths = 1;
+  if (g_hw.screw_x_hundredths > 5000) g_hw.screw_x_hundredths = 5000;
+  if (g_hw.mcstep_x < 1) g_hw.mcstep_x = 1;
+  if (g_hw.mcstep_x > 128) g_hw.mcstep_x = 128;
+
+  if (g_hw.min_feed < 1) g_hw.min_feed = 1;
+  if (g_hw.max_feed < g_hw.min_feed) g_hw.max_feed = g_hw.min_feed;
+  if (g_hw.max_feed > 250) g_hw.max_feed = 250;
+
+  if (g_hw.min_afeed < 1) g_hw.min_afeed = 1;
+  if (g_hw.max_afeed < g_hw.min_afeed) g_hw.max_afeed = g_hw.min_afeed;
+  if (g_hw.max_afeed > 5000) g_hw.max_afeed = 5000;
+
+  if (g_hw.max_rapid_motion < 1) g_hw.max_rapid_motion = 1;
+  if (g_hw.max_rapid_motion > 255) g_hw.max_rapid_motion = 255;
+  if (g_hw.rapid_span < 1) g_hw.rapid_span = 1;
+  if (g_hw.rapid_span > 255) g_hw.rapid_span = 255;
+
+  if (g_hw.hc_scale_1 < 1) g_hw.hc_scale_1 = 1;
+  if (g_hw.hc_scale_10 < 1) g_hw.hc_scale_10 = 1;
+  if (g_hw.hc_start_speed_1 < 1) g_hw.hc_start_speed_1 = 1;
+  if (g_hw.hc_start_speed_10 < 1) g_hw.hc_start_speed_10 = 1;
+  if (g_hw.hc_max_speed_1 < 1) g_hw.hc_max_speed_1 = 1;
+  if (g_hw.hc_max_speed_10 < 1) g_hw.hc_max_speed_10 = 1;
+}
+
+static uint16_t hwCalcCrc(const HwSettings& s)
+{
+  HwSettings tmp = s;
+  tmp.crc = 0;
+  return crc16_ccitt((const uint8_t*)&tmp, sizeof(tmp));
+}
+
+static void hwLoad()
+{
+#if HAVE_EEPROM
+  HwSettings tmp;
+  EEPROM.get(0, tmp);
+  if (tmp.magic == kHwMagic && tmp.version == kHwVersion) {
+    const uint16_t want = hwCalcCrc(tmp);
+    if (want == tmp.crc) {
+      g_hw = tmp;
+    }
+  }
+#endif
+  hwClamp();
+  hwApplyDerived();
+}
+
+static void hwSave()
+{
+  hwClamp();
+  hwApplyDerived();
+#if HAVE_EEPROM
+  g_hw.magic = kHwMagic;
+  g_hw.version = kHwVersion;
+  g_hw.crc = hwCalcCrc(g_hw);
+  EEPROM.put(0, g_hw);
+#endif
+  g_hw_dirty = false;
+  g_hw_saved_banner_until_ms = millis() + 1200u;
+}
 
 volatile int32_t spindle_pos = 0;
 volatile int32_t last_spindle_pos = 0;
@@ -232,10 +412,155 @@ static uint8_t last_keys_reading = 0;
 static bool beeper_on = false;
 static uint32_t beeper_until_ms = 0;
 
+enum class HwItem : uint8_t
+{
+  EncLines = 0,
+  MotorZStepsPerRev,
+  ScrewZHundredths,
+  McStepZ,
+  MotorXStepsPerRev,
+  ScrewXHundredths,
+  McStepX,
+  ReboundX,
+  ReboundZ,
+  ThrdAccel,
+  FeedAccel,
+  MinFeed,
+  MaxFeed,
+  MinAfeed,
+  MaxAfeed,
+  ExcessLag,
+  PassFinish,
+  TachoTh,
+  MaxRapidMotion,
+  RapidSpan,
+  HcScale1,
+  HcScale10,
+  HcStartSpeed1,
+  HcMaxSpeed1,
+  HcStartSpeed10,
+  HcMaxSpeed10,
+  HcXDir,
+  Count
+};
+
+struct HwItemDesc
+{
+  HwItem id;
+  const char* label;
+  uint32_t minv;
+  uint32_t maxv;
+  uint32_t step;
+};
+
+static constexpr HwItemDesc kHwItems[] = {
+    {HwItem::EncLines, "ENC L/R", 1, 10000, 10},
+    {HwItem::MotorZStepsPerRev, "MZ S/R", 1, 40000, 10},
+    {HwItem::ScrewZHundredths, "SZ 0.01", 1, 5000, 1},
+    {HwItem::McStepZ, "McZ", 1, 128, 1},
+    {HwItem::MotorXStepsPerRev, "MX S/R", 1, 40000, 10},
+    {HwItem::ScrewXHundredths, "SX 0.01", 1, 5000, 1},
+    {HwItem::McStepX, "McX", 1, 128, 1},
+    {HwItem::ReboundX, "RBX", 0, 20000, 10},
+    {HwItem::ReboundZ, "RBZ", 0, 20000, 10},
+    {HwItem::ThrdAccel, "THR ACC", 0, 255, 1},
+    {HwItem::FeedAccel, "FED ACC", 0, 255, 1},
+    {HwItem::MinFeed, "MIN FED", 1, 250, 1},
+    {HwItem::MaxFeed, "MAX FED", 1, 250, 1},
+    {HwItem::MinAfeed, "MIN aF", 1, 5000, 5},
+    {HwItem::MaxAfeed, "MAX aF", 1, 5000, 5},
+    {HwItem::ExcessLag, "EX LAG", 0, 255, 1},
+    {HwItem::PassFinish, "P FIN", 0, 10, 1},
+    {HwItem::TachoTh, "TACHO Th", 0, 65535, 50},
+    {HwItem::MaxRapidMotion, "RAP MAX", 1, 255, 1},
+    {HwItem::RapidSpan, "RAP SPN", 1, 255, 1},
+    {HwItem::HcScale1, "HC S1", 1, 100, 1},
+    {HwItem::HcScale10, "HC S10", 1, 200, 1},
+    {HwItem::HcStartSpeed1, "HC ST1", 1, 65535, 1},
+    {HwItem::HcMaxSpeed1, "HC MX1", 1, 65535, 1},
+    {HwItem::HcStartSpeed10, "HC ST10", 1, 65535, 1},
+    {HwItem::HcMaxSpeed10, "HC MX10", 1, 65535, 1},
+    {HwItem::HcXDir, "HC XDIR", 0, 1, 1},
+};
+
+static uint8_t hw_top = 0;
+
+static uint32_t hwGet(HwItem id)
+{
+  switch (id) {
+    case HwItem::EncLines: return g_hw.enc_lines_per_rev;
+    case HwItem::MotorZStepsPerRev: return g_hw.motor_z_steps_per_rev;
+    case HwItem::ScrewZHundredths: return g_hw.screw_z_hundredths;
+    case HwItem::McStepZ: return g_hw.mcstep_z;
+    case HwItem::MotorXStepsPerRev: return g_hw.motor_x_steps_per_rev;
+    case HwItem::ScrewXHundredths: return g_hw.screw_x_hundredths;
+    case HwItem::McStepX: return g_hw.mcstep_x;
+    case HwItem::ReboundX: return g_hw.rebound_x;
+    case HwItem::ReboundZ: return g_hw.rebound_z;
+    case HwItem::ThrdAccel: return g_hw.thrd_accel;
+    case HwItem::FeedAccel: return g_hw.feed_accel;
+    case HwItem::MinFeed: return g_hw.min_feed;
+    case HwItem::MaxFeed: return g_hw.max_feed;
+    case HwItem::MinAfeed: return g_hw.min_afeed;
+    case HwItem::MaxAfeed: return g_hw.max_afeed;
+    case HwItem::ExcessLag: return g_hw.excess_lag;
+    case HwItem::PassFinish: return g_hw.pass_finish;
+    case HwItem::TachoTh: return g_hw.tacho_th;
+    case HwItem::MaxRapidMotion: return g_hw.max_rapid_motion;
+    case HwItem::RapidSpan: return g_hw.rapid_span;
+    case HwItem::HcScale1: return g_hw.hc_scale_1;
+    case HwItem::HcScale10: return g_hw.hc_scale_10;
+    case HwItem::HcStartSpeed1: return g_hw.hc_start_speed_1;
+    case HwItem::HcMaxSpeed1: return g_hw.hc_max_speed_1;
+    case HwItem::HcStartSpeed10: return g_hw.hc_start_speed_10;
+    case HwItem::HcMaxSpeed10: return g_hw.hc_max_speed_10;
+    case HwItem::HcXDir: return g_hw.hc_x_dir;
+    default: return 0;
+  }
+}
+
+static void hwSet(HwItem id, uint32_t v)
+{
+  switch (id) {
+    case HwItem::EncLines: g_hw.enc_lines_per_rev = (uint16_t)v; break;
+    case HwItem::MotorZStepsPerRev: g_hw.motor_z_steps_per_rev = (uint16_t)v; break;
+    case HwItem::ScrewZHundredths: g_hw.screw_z_hundredths = (uint16_t)v; break;
+    case HwItem::McStepZ: g_hw.mcstep_z = (uint8_t)v; break;
+    case HwItem::MotorXStepsPerRev: g_hw.motor_x_steps_per_rev = (uint16_t)v; break;
+    case HwItem::ScrewXHundredths: g_hw.screw_x_hundredths = (uint16_t)v; break;
+    case HwItem::McStepX: g_hw.mcstep_x = (uint8_t)v; break;
+    case HwItem::ReboundX: g_hw.rebound_x = (uint16_t)v; break;
+    case HwItem::ReboundZ: g_hw.rebound_z = (uint16_t)v; break;
+    case HwItem::ThrdAccel: g_hw.thrd_accel = (uint8_t)v; break;
+    case HwItem::FeedAccel: g_hw.feed_accel = (uint8_t)v; break;
+    case HwItem::MinFeed: g_hw.min_feed = (uint8_t)v; break;
+    case HwItem::MaxFeed: g_hw.max_feed = (uint8_t)v; break;
+    case HwItem::MinAfeed: g_hw.min_afeed = (uint16_t)v; break;
+    case HwItem::MaxAfeed: g_hw.max_afeed = (uint16_t)v; break;
+    case HwItem::ExcessLag: g_hw.excess_lag = (uint8_t)v; break;
+    case HwItem::PassFinish: g_hw.pass_finish = (uint8_t)v; break;
+    case HwItem::TachoTh: g_hw.tacho_th = (uint16_t)v; break;
+    case HwItem::MaxRapidMotion: g_hw.max_rapid_motion = (uint8_t)v; break;
+    case HwItem::RapidSpan: g_hw.rapid_span = (uint8_t)v; break;
+    case HwItem::HcScale1: g_hw.hc_scale_1 = (uint8_t)v; break;
+    case HwItem::HcScale10: g_hw.hc_scale_10 = (uint8_t)v; break;
+    case HwItem::HcStartSpeed1: g_hw.hc_start_speed_1 = (uint16_t)v; break;
+    case HwItem::HcMaxSpeed1: g_hw.hc_max_speed_1 = (uint16_t)v; break;
+    case HwItem::HcStartSpeed10: g_hw.hc_start_speed_10 = (uint16_t)v; break;
+    case HwItem::HcMaxSpeed10: g_hw.hc_max_speed_10 = (uint16_t)v; break;
+    case HwItem::HcXDir: g_hw.hc_x_dir = (uint8_t)v; break;
+    default: break;
+  }
+  hwClamp();
+  hwApplyDerived();
+  g_hw_dirty = true;
+}
+
 // Hand wheel: live values for LCD (TIM4 counter + axis/scale switches)
 enum class HandAxisSel : uint8_t { None, Z, X };
 static HandAxisSel g_hand_axis_disp = HandAxisSel::None;
-static int16_t g_hand_cnt_disp = 0;
+/* TIM4 CNT — 16-біт беззнаковий; int16 каст давав дивний вигляд біля 32768. */
+static uint16_t g_hand_cnt_disp = 0;
 static uint16_t g_hand_scale_mult_disp = 1;
 
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
@@ -329,12 +654,53 @@ static SubMode decodeSubmodeFromRawPd(uint8_t pd8_10_highmask)
 
 static void applySelectionMarker(uint8_t row, char s[21])
 {
+  if (current_mode == MODE_RESERVE && row == 0) {
+    s[20] = '\0';
+    return;
+  }
   // Cursor must be on the left side (col 0).
   // Shift content right by 1 and put marker at [0].
   // Keep total width at 20 chars.
   memmove(&s[1], &s[0], 19);
   s[0] = (row == selected_row) ? '>' : ' ';
   s[20] = '\0';
+}
+
+static uint8_t hwStepMulIdx = 0;
+static constexpr uint16_t kHwStepMul[3] = {1, 10, 100};
+
+static void makeHwHeader(char out[21])
+{
+  const uint32_t now = millis();
+  if ((int32_t)(now - g_hw_saved_banner_until_ms) < 0) {
+    snprintf(out, 21, "HW SAVED");
+  } else {
+    snprintf(out, 21, "HW SET x%u %c",
+             (unsigned)kHwStepMul[hwStepMulIdx],
+             g_hw_dirty ? '*' : ' ');
+  }
+}
+
+static void makeHwItemRow(uint8_t slot, char out[21])
+{
+  const uint8_t count = (uint8_t)(sizeof(kHwItems) / sizeof(kHwItems[0]));
+  const uint8_t idx = (uint8_t)(hw_top + slot);
+  if (idx >= count) {
+    snprintf(out, 21, " ");
+    return;
+  }
+
+  const HwItemDesc& d = kHwItems[idx];
+  const uint32_t v = hwGet(d.id);
+
+  if (d.id == HwItem::ScrewZHundredths || d.id == HwItem::ScrewXHundredths) {
+    snprintf(out, 21, "%-7s:%3lu.%02lu",
+             d.label,
+             (unsigned long)(v / 100u),
+             (unsigned long)(v % 100u));
+    return;
+  }
+  snprintf(out, 21, "%-7s:%8lu", d.label, (unsigned long)v);
 }
 
 static void makeRow0(char out[21])
@@ -375,13 +741,13 @@ static void makeRow1(char out[21])
     case MODE_TACHO:
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
       snprintf(out, 21, "RPM:%5u t/r%u", (unsigned)g_spindle_rpm_disp,
-               (unsigned)(SPINDLE_QUAD_TICKS_PER_REV > 9999 ? 9999 : SPINDLE_QUAD_TICKS_PER_REV));
+               (unsigned)(g_spindle_ticks_per_rev > 9999 ? 9999 : g_spindle_ticks_per_rev));
 #else
       snprintf(out, 21, "RPM:  %u", (unsigned)(feed_x100 * 10));
 #endif
       break;
     case MODE_RESERVE:
-      snprintf(out, 21, "RES:  %u", (unsigned)(feed_x100));
+      snprintf(out, 21, " ");
       break;
     default:
       snprintf(out, 21, " ");
@@ -400,12 +766,12 @@ static void makeRow3(char out[21])
   char axc = '.';
   if (g_hand_axis_disp == HandAxisSel::Z) axc = 'Z';
   else if (g_hand_axis_disp == HandAxisSel::X) axc = 'X';
-  snprintf(out, 21, "DOC%u.%02u %c%3u %5d",
+  snprintf(out, 21, "DOC:%u.%02u %c%3u %5u",
            (unsigned)(doc_x100 / 100),
            (unsigned)(doc_x100 % 100),
            axc,
            (unsigned)g_hand_scale_mult_disp,
-           (int)g_hand_cnt_disp);
+           (unsigned)g_hand_cnt_disp);
 }
 
 static void makeSubmenuRow0(char out[21])
@@ -468,7 +834,13 @@ static void updateDisplay()
 {
   char rows[4][21];
 
-  if (!in_submenu) {
+  if (current_mode == MODE_RESERVE) {
+    if (selected_row < 1 || selected_row > 3) selected_row = 1;
+    makeHwHeader(rows[0]); padTo20(rows[0]); applySelectionMarker(0, rows[0]);
+    makeHwItemRow(0, rows[1]); padTo20(rows[1]); applySelectionMarker(1, rows[1]);
+    makeHwItemRow(1, rows[2]); padTo20(rows[2]); applySelectionMarker(2, rows[2]);
+    makeHwItemRow(2, rows[3]); padTo20(rows[3]); applySelectionMarker(3, rows[3]);
+  } else if (!in_submenu) {
     makeRow0(rows[0]); padTo20(rows[0]); applySelectionMarker(0, rows[0]);
     makeRow1(rows[1]); padTo20(rows[1]); applySelectionMarker(1, rows[1]);
     makeRow2(rows[2]); padTo20(rows[2]); applySelectionMarker(2, rows[2]);
@@ -489,7 +861,18 @@ static void updateDisplay()
     return;
   }
 
-  for (uint8_t r = 0; r < 4; r++) writeRowDiff(r, rows[r]);
+  /* Рядок 3 (DOC + лічильник РГІ): по сегментах інколи «залипають» старші цифри на HD44780+I2C. */
+  for (uint8_t r = 0; r < 4; r++) {
+    if (r == 3) {
+      if (!cache_valid || strncmp(rows[3], last_rows[3], 20) != 0) {
+        lcd.setCursor(0, r);
+        lcd.print(rows[r]);
+        strncpy(last_rows[r], rows[r], 21);
+      }
+    } else {
+      writeRowDiff(r, rows[r]);
+    }
+  }
   cache_valid = true;
 }
 
@@ -856,7 +1239,7 @@ static uint32_t limitMinCorridorStepsForFeed(bool forRapidSpeed)
 {
   const uint32_t sps = feedToStepsPerSecond(feed_x100, forRapidSpeed);
   uint32_t d = (sps * LIMIT_ACCEL_DECEL_MS) / 1000U;
-  if (d < (uint32_t)ARDUINO_LIMIT_GAP_STEPS) d = (uint32_t)ARDUINO_LIMIT_GAP_STEPS;
+  if (d < g_limit_gap_steps) d = g_limit_gap_steps;
   return d;
 }
 
@@ -1116,6 +1499,7 @@ static bool softLimitAllowsX(bool) { return true; }
 
 static bool motionInhibited()
 {
+  if (current_mode == MODE_RESERVE) return true;
 #if ENABLE_SOFTWARE_LIMITS
   if (limitsMechTrip()) return true;
 #endif
@@ -1141,18 +1525,95 @@ static bool motionInhibited()
 }
 
 // ---------------------------------------------------------------------------
-// Hand encoder (TIM4 quadrature on PD12/PD13) + axis / scale switches
+// Hand encoder (PD12/PD13) + axis / scale switches
 // Joystick has priority: hand wheel is ignored while the joystick is off-center.
+//
+// HAND_ENCODER_SOFTWARE_QUAD=1 (default): GPIO + таблиця Грея (як linear_encoders) — стабільніше за TIM4
+//   при слабкому сигналі / неправильній полярності TI.
+// HAND_ENCODER_SOFTWARE_QUAD=0: апаратний енкодер TIM4, полярність BOTHEDGE, фільтр 0.
+// HAND_ENC_INVERT=1 — інвертувати напрямок лічильника ручного колеса.
 // ---------------------------------------------------------------------------
 #if defined(STM32F407xx)
-static uint16_t s_hand_enc_last = 0;
+
+#ifndef HAND_ENCODER_SOFTWARE_QUAD
+#define HAND_ENCODER_SOFTWARE_QUAD 1
+#endif
+#ifndef HAND_ENC_INVERT
+#define HAND_ENC_INVERT 0
+#endif
+/* Сирих переходів квадратури на один механічний щелчок (EC11 у режимі «всі фронти» ≈ 4). 2 — деякі енкодери. */
+#ifndef HAND_ENCODER_RAW_PER_STEP
+#define HAND_ENCODER_RAW_PER_STEP 4
+#endif
+
+static int32_t handEncoderFloorDiv(int32_t a, int32_t b)
+{
+  if (b <= 1) return a;
+  if (a >= 0) return a / b;
+  return -((-a + b - 1) / b);
+}
+
+static int32_t handEncoderStepsFromRaw(int32_t raw)
+{
+  const int32_t k = (int32_t)HAND_ENCODER_RAW_PER_STEP;
+  if (k <= 1) return raw;
+  return handEncoderFloorDiv(raw, k);
+}
+
+/* Позиція в «кроках» (щелчках), узгоджена з handEncoderReadDelta. */
+static int32_t s_hand_step_emitted;
+
+#if HAND_ENCODER_SOFTWARE_QUAD
+static const int8_t kHandQuad[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
+static uint8_t s_hand_prev_ab;
+static int32_t s_hand_quad_total;
+
+static uint8_t handEncoderReadAB()
+{
+  const bool a = digitalRead(ENC_HC_A_PIN) == LOW;
+  const bool b = digitalRead(ENC_HC_B_PIN) == LOW;
+  return (uint8_t)((a ? 2u : 0u) | (b ? 1u : 0u));
+}
+
+static void handEncoderPollQuad()
+{
+  const uint8_t cur = handEncoderReadAB();
+  if (cur == s_hand_prev_ab) return;
+  const uint8_t idx = (uint8_t)((s_hand_prev_ab << 2) | cur);
+  int8_t d = kHandQuad[idx];
+#if HAND_ENC_INVERT
+  d = (int8_t)-d;
+#endif
+  s_hand_quad_total += (int32_t)d;
+  s_hand_prev_ab = cur;
+}
+#else
+static uint16_t s_hand_tim4_last = 0;
+static int32_t s_hand_tim4_raw_accum = 0;
+static void handEncoderPollQuad()
+{
+  const uint16_t c = LL_TIM_GetCounter(TIM4);
+  int32_t dc = (int32_t)c - (int32_t)s_hand_tim4_last;
+  if (dc > 32767) dc -= 65536;
+  if (dc < -32768) dc += 65536;
+  s_hand_tim4_last = c;
+  s_hand_tim4_raw_accum += dc;
+}
+#endif
 
 static void handEncoderHwInit()
 {
-  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM4);
   LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOD);
 
-  // LL needs GPIO pin bit masks, not Arduino pin numbers.
+#if HAND_ENCODER_SOFTWARE_QUAD
+  pinMode(ENC_HC_A_PIN, INPUT_PULLUP);
+  pinMode(ENC_HC_B_PIN, INPUT_PULLUP);
+  s_hand_prev_ab = handEncoderReadAB();
+  s_hand_quad_total = 0;
+  s_hand_step_emitted = 0;
+#else
+  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM4);
+
   LL_GPIO_SetPinMode(GPIOD, LL_GPIO_PIN_12 | LL_GPIO_PIN_13, LL_GPIO_MODE_ALTERNATE);
   LL_GPIO_SetAFPin_8_15(GPIOD, LL_GPIO_PIN_12, LL_GPIO_AF_2);
   LL_GPIO_SetAFPin_8_15(GPIOD, LL_GPIO_PIN_13, LL_GPIO_AF_2);
@@ -1168,19 +1629,22 @@ static void handEncoderHwInit()
 
   LL_TIM_ENCODER_InitTypeDef enc = {};
   enc.EncoderMode = LL_TIM_ENCODERMODE_X4_TI12;
-  enc.IC1Polarity = LL_TIM_IC_POLARITY_RISING;
+  enc.IC1Polarity = LL_TIM_IC_POLARITY_BOTHEDGE;
   enc.IC1ActiveInput = LL_TIM_ACTIVEINPUT_DIRECTTI;
   enc.IC1Prescaler = LL_TIM_ICPSC_DIV1;
-  enc.IC1Filter = 0x6;
-  enc.IC2Polarity = LL_TIM_IC_POLARITY_RISING;
+  enc.IC1Filter = 0;
+  enc.IC2Polarity = LL_TIM_IC_POLARITY_BOTHEDGE;
   enc.IC2ActiveInput = LL_TIM_ACTIVEINPUT_DIRECTTI;
   enc.IC2Prescaler = LL_TIM_ICPSC_DIV1;
-  enc.IC2Filter = 0x6;
+  enc.IC2Filter = 0;
   LL_TIM_ENCODER_Init(TIM4, &enc);
 
   LL_TIM_SetCounter(TIM4, 0);
   LL_TIM_EnableCounter(TIM4);
-  s_hand_enc_last = 0;
+  s_hand_tim4_last = LL_TIM_GetCounter(TIM4);
+  s_hand_tim4_raw_accum = 0;
+  s_hand_step_emitted = 0;
+#endif
 }
 
 #if ENABLE_SPINDLE_ENCODER
@@ -1223,13 +1687,24 @@ static void spindleEncoderHwInit() {}
 
 static int16_t handEncoderReadDelta()
 {
-  const uint16_t c = LL_TIM_GetCounter(TIM4);
-  const int16_t d = (int16_t)(c - s_hand_enc_last);
-  s_hand_enc_last = c;
-  return d;
+  handEncoderPollQuad();
+  int32_t raw;
+#if HAND_ENCODER_SOFTWARE_QUAD
+  raw = s_hand_quad_total;
+#else
+  raw = s_hand_tim4_raw_accum;
+#endif
+
+  const int32_t steps_now = handEncoderStepsFromRaw(raw);
+  int32_t d = steps_now - s_hand_step_emitted;
+  s_hand_step_emitted = steps_now;
+  if (d > 32767) d = 32767;
+  if (d < -32768) d = -32768;
+  return (int16_t)d;
 }
 #else
 static void handEncoderHwInit() {}
+static void handEncoderPollQuad() {}
 static int16_t handEncoderReadDelta() { return 0; }
 static void spindleEncoderHwInit() {}
 #endif
@@ -1321,7 +1796,7 @@ static void updateHandWheelJog()
   }
 
   int16_t d = handEncoderReadDelta();
-  if (HAND_ENCODER_INVERT_X && ax == HandAxisSel::X) d = (int16_t)-d;
+  if (g_hand_encoder_invert_x && ax == HandAxisSel::X) d = (int16_t)-d;
   if (d != 0) {
     const int mult = (int)readHandScaleMultiplier();
     int32_t add = (int32_t)d * mult;
@@ -1366,14 +1841,19 @@ static void updateHandWheelJog()
 static void handEncoderUiSnapshot()
 {
 #if defined(STM32F407xx)
-  g_hand_cnt_disp = (int16_t)LL_TIM_GetCounter(TIM4);
+  handEncoderPollQuad();
+#if HAND_ENCODER_SOFTWARE_QUAD
+  g_hand_cnt_disp = (uint16_t)((uint32_t)handEncoderStepsFromRaw(s_hand_quad_total) & 0xFFFFu);
+#else
+  g_hand_cnt_disp = (uint16_t)((uint32_t)handEncoderStepsFromRaw(s_hand_tim4_raw_accum) & 0xFFFFu);
+#endif
 #else
   g_hand_cnt_disp = 0;
 #endif
   g_hand_axis_disp = readHandAxisDebounced();
   g_hand_scale_mult_disp = readHandScaleMultiplier();
 
-  static int16_t s_last_cnt = 0x7fff;
+  static uint16_t s_last_cnt = 0xffff;
   static HandAxisSel s_last_ax = HandAxisSel::None;
   static uint16_t s_last_sc = 0;
   if (g_hand_cnt_disp != s_last_cnt || g_hand_axis_disp != s_last_ax || g_hand_scale_mult_disp != s_last_sc) {
@@ -1415,10 +1895,10 @@ static void spindleEncoderUiSnapshot()
   delta = (int16_t)-delta;
 #endif
   spindle_pos += (int32_t)delta;
-  if (spindle_pos >= (int32_t)SPINDLE_QUAD_TICKS_PER_REV)
+  if (spindle_pos >= (int32_t)g_spindle_ticks_per_rev)
     spindle_pos = 0;
   else if (spindle_pos < 0)
-    spindle_pos = (int32_t)SPINDLE_QUAD_TICKS_PER_REV - 1;
+    spindle_pos = (int32_t)g_spindle_ticks_per_rev - 1;
 
   if (spindle_pos != last_spindle_pos)
   {
@@ -1433,8 +1913,8 @@ static void spindleEncoderUiSnapshot()
   if (dt >= 200u) {
     const int64_t acc_abs = s_sp_acc >= 0 ? (int64_t)s_sp_acc : -(int64_t)s_sp_acc;
     uint32_t rpm = 0;
-    if (SPINDLE_QUAD_TICKS_PER_REV > 0u && dt > 0u)
-      rpm = (uint32_t)((acc_abs * 60000ULL) / (uint64_t)SPINDLE_QUAD_TICKS_PER_REV / (uint64_t)dt);
+    if (g_spindle_ticks_per_rev > 0u && dt > 0u)
+      rpm = (uint32_t)((acc_abs * 60000ULL) / (uint64_t)g_spindle_ticks_per_rev / (uint64_t)dt);
     if (rpm > 9999u) rpm = 9999u;
     g_spindle_rpm_disp = (uint16_t)rpm;
     s_sp_acc = 0;
@@ -1464,17 +1944,15 @@ static uint8_t joyDirToAfeedJoy(JoyDir d)
   }
 }
 
-/* DOC (мм×100) → кроки X: ті самі константи, що els_afeed::infeed_u (kMotorXStepPerRev / SCREW_X * McSTEP_X). */
-static constexpr int32_t kManAfeedMotorXStepPerRev = 300;
-static constexpr int32_t kManAfeedScrewXHundredths = 150;
-static constexpr int32_t kManAfeedMcStepX = 4;
-
 static int32_t manAfeedDocToXSteps(uint16_t doc100)
 {
   if (doc100 < 1)
     return 0;
-  return (int32_t)lroundf((float)kManAfeedMotorXStepPerRev * (float)doc100 / (float)kManAfeedScrewXHundredths *
-                          (float)kManAfeedMcStepX);
+  const float motor = (float)g_hw.motor_x_steps_per_rev;
+  const float screw = (float)g_hw.screw_x_hundredths;
+  const float mc = (float)g_hw.mcstep_x;
+  if (screw <= 0.0f) return 0;
+  return (int32_t)lroundf(motor * (float)doc100 / screw * mc);
 }
 
 /* Швидкість шатла Z у MAN: не залежить лише від лінійної карти горщика; підняті підлога/стеля. */
@@ -1735,6 +2213,73 @@ static void updateBeeper()
 
 static void applyKeyPress(uint8_t key, bool isRepeat = false)
 {
+  if (current_mode == MODE_RESERVE) {
+    const uint8_t count = (uint8_t)(sizeof(kHwItems) / sizeof(kHwItems[0]));
+    const uint8_t selSlot = (selected_row < 1) ? 0 : (uint8_t)(selected_row - 1);
+    const uint8_t selIdx = (uint8_t)(hw_top + selSlot);
+
+    switch (key) {
+      case KEY_SEL:
+        hwStepMulIdx = (uint8_t)((hwStepMulIdx + 1u) % 3u);
+        break;
+      case KEY_UP:
+        if (selected_row > 1) {
+          selected_row--;
+        } else if (hw_top > 0) {
+          hw_top--;
+        } else {
+          if (count <= 3) {
+            selected_row = count == 0 ? 1 : count;
+            hw_top = 0;
+          } else {
+            hw_top = (uint8_t)(count - 3);
+            selected_row = 3;
+          }
+        }
+        break;
+      case KEY_DOWN:
+        if (count == 0) {
+          selected_row = 1;
+          hw_top = 0;
+          break;
+        }
+        if ((uint8_t)(selIdx + 1u) < count) {
+          const uint8_t remaining = (uint8_t)(count - hw_top);
+          if (selected_row < 3 && selected_row < remaining) {
+            selected_row++;
+          } else {
+            hw_top++;
+          }
+        } else {
+          hw_top = 0;
+          selected_row = 1;
+        }
+        break;
+      case KEY_LEFT:
+      case KEY_RIGHT:
+        if (selIdx < count) {
+          const HwItemDesc& d = kHwItems[selIdx];
+          const uint32_t step = (uint32_t)d.step * (uint32_t)kHwStepMul[hwStepMulIdx];
+          uint32_t v = hwGet(d.id);
+          if (key == KEY_LEFT) {
+            if (v > step) v -= step;
+            else v = 0;
+          } else {
+            v += step;
+          }
+          if (v < d.minv) v = d.minv;
+          if (v > d.maxv) v = d.maxv;
+          hwSet(d.id, v);
+        }
+        break;
+      default:
+        break;
+    }
+    if (!isRepeat) beeperTrigger(BEEP_MS);
+    updateDisplay();
+    return;
+  }
+
   switch (key) {
     case KEY_SEL:
       // Short press SEL: toggle submode on row0 (main screen) or row1 (submenu)
@@ -1832,10 +2377,16 @@ static void updateButtonsDebounced()
       selRawDownMs = now;
       selLongFired = false;
     } else if (!selLongFired && (now - selRawDownMs) >= LONGPRESS_MS) {
-      in_submenu = !in_submenu;
-      selected_row = in_submenu ? 1 : 0;
-      cache_valid = false;
-      updateDisplay();
+      if (current_mode == MODE_RESERVE) {
+        hwSave();
+        cache_valid = false;
+        updateDisplay();
+      } else {
+        in_submenu = !in_submenu;
+        selected_row = in_submenu ? 1 : 0;
+        cache_valid = false;
+        updateDisplay();
+      }
       selLongFired = true;
     }
   } else {
@@ -1957,6 +2508,12 @@ static void syncModeSubmodeNow()
   const bool okMode = decodeModeFromByte(m, newMode);
   if (okMode) current_mode = newMode;
 
+  if (current_mode == MODE_RESERVE) {
+    in_submenu = false;
+    selected_row = 1;
+    hw_top = 0;
+  }
+
   const SubMode newSub = decodeSubmodeFromRawPd(last_pd8_10);
   for (uint8_t i = 0; i < MODE_COUNT; i++) submode_per_mode[i] = newSub;
 
@@ -1968,6 +2525,8 @@ static void updateModeSubmodeFromSwitches()
 {
   // main behavior: ignore mode/submode switching while joystick is driving an axis
   if (joy_z_active || joy_x_active) return;
+
+  const Mode prevMode = current_mode;
 
   // Debounce mode + submode switches as one combined state
   static uint8_t lastModeByte = 0xFF;
@@ -2002,6 +2561,18 @@ static void updateModeSubmodeFromSwitches()
   const bool okMode = decodeModeFromByte(stableModeByte, newMode);
 
   if (okMode) current_mode = newMode;
+
+  if (current_mode != prevMode) {
+    if (current_mode == MODE_RESERVE) {
+      in_submenu = false;
+      selected_row = 1;
+      hw_top = 0;
+    } else if (prevMode == MODE_RESERVE) {
+      in_submenu = false;
+      selected_row = 0;
+      hw_top = 0;
+    }
+  }
   // Decode SUBMODE using raw PD9/PD10 low detection (more tolerant than bit patterns)
   const SubMode newSub = decodeSubmodeFromRawPd(last_pd8_10);
   for (uint8_t i = 0; i < MODE_COUNT; i++) submode_per_mode[i] = newSub;
@@ -2065,6 +2636,8 @@ void setup()
   lcd.init();
   lcd.backlight();
 
+  hwLoad();
+
   beeperInit();
   stepperInitPins();
   limitsInitPins();
@@ -2118,11 +2691,17 @@ void setup()
   delay(5);
 
   syncModeSubmodeNow();
+  /* Підтягнути ручний енкодер / вісь / SCALE у g_* до першого малювання (інакше рядок 3 лишається . 1 0). */
+  handEncoderUiSnapshot();
+  spindleEncoderUiSnapshot();
   updateDisplay(); // initial paint
 }
 
 void loop()
 {
+#if defined(STM32F407xx)
+  handEncoderPollQuad();
+#endif
   linearEncodersPoll();
   handEncoderUiSnapshot();
   spindleEncoderUiSnapshot();
@@ -2139,4 +2718,8 @@ void loop()
     updateButtonsDebounced();
   }
   updateBeeper();
+
+  /* handEncoderUiSnapshot / spindle / ін. ставлять cache_valid=false — без цього LCD не оновлюється в loop(). */
+  if (!cache_valid)
+    updateDisplay();
 }
