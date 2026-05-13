@@ -1545,6 +1545,9 @@ static bool motionInhibited()
 #ifndef HAND_ENCODER_DISPLAY_RAW_PER_DETENT
 #define HAND_ENCODER_DISPLAY_RAW_PER_DETENT 4
 #endif
+#ifndef HAND_ENCODER_USE_INTERRUPTS
+#define HAND_ENCODER_USE_INTERRUPTS 1
+#endif
 
 static int32_t handEncoderFloorDiv(int32_t a, int32_t b)
 {
@@ -1562,28 +1565,43 @@ static int32_t handEncoderDisplayDetents(int32_t raw)
 
 #if HAND_ENCODER_SOFTWARE_QUAD
 static const int8_t kHandQuad[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
-static uint8_t s_hand_prev_ab;
-static int32_t s_hand_quad_total;
+static volatile uint8_t s_hand_prev_ab;
+static volatile int32_t s_hand_quad_total;
 static int32_t s_hand_quad_read_last;
 
-static uint8_t handEncoderReadAB()
+static inline uint8_t handEncoderReadAB()
 {
-  const bool a = digitalRead(ENC_HC_A_PIN) == LOW;
-  const bool b = digitalRead(ENC_HC_B_PIN) == LOW;
+  const bool a = !LL_GPIO_IsInputPinSet(GPIOD, LL_GPIO_PIN_12);
+  const bool b = !LL_GPIO_IsInputPinSet(GPIOD, LL_GPIO_PIN_13);
   return (uint8_t)((a ? 2u : 0u) | (b ? 1u : 0u));
 }
 
-static void handEncoderPollQuad()
+static inline void handEncoderQuadUpdate()
 {
   const uint8_t cur = handEncoderReadAB();
-  if (cur == s_hand_prev_ab) return;
-  const uint8_t idx = (uint8_t)((s_hand_prev_ab << 2) | cur);
+  const uint8_t prev = s_hand_prev_ab;
+  if (cur == prev) return;
+  const uint8_t idx = (uint8_t)((prev << 2) | cur);
   int8_t d = kHandQuad[idx];
 #if HAND_ENC_INVERT
   d = (int8_t)-d;
 #endif
   s_hand_quad_total += (int32_t)d;
   s_hand_prev_ab = cur;
+}
+
+#if HAND_ENCODER_USE_INTERRUPTS
+static void handEncoderIsrA() { handEncoderQuadUpdate(); }
+static void handEncoderIsrB() { handEncoderQuadUpdate(); }
+#endif
+
+static void handEncoderPollQuad()
+{
+#if HAND_ENCODER_USE_INTERRUPTS
+  return;
+#else
+  handEncoderQuadUpdate();
+#endif
 }
 #else
 static uint16_t s_hand_tim4_last = 0;
@@ -1610,6 +1628,10 @@ static void handEncoderHwInit()
   s_hand_prev_ab = handEncoderReadAB();
   s_hand_quad_total = 0;
   s_hand_quad_read_last = 0;
+#if HAND_ENCODER_USE_INTERRUPTS
+  attachInterrupt(digitalPinToInterrupt(ENC_HC_A_PIN), handEncoderIsrA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_HC_B_PIN), handEncoderIsrB, CHANGE);
+#endif
 #else
   LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM4);
 
@@ -1731,16 +1753,36 @@ static HandAxisSel readHandAxisDebounced()
 
 // 3-position switch: exactly one of PD4/PD5/PD6 is LOW (×100 / ×1 / ×10).
 // If none or more than one LOW (transition/bad wiring), default to ×1.
-static uint16_t readHandScaleMultiplier()
+static bool readHandScaleMultiplierRaw(uint16_t* out_mult)
 {
   const bool s100 = (digitalRead(SCALE_X100_PIN) == LOW);
   const bool s1 = (digitalRead(SCALE_X1_PIN) == LOW);
   const bool s10 = (digitalRead(SCALE_X10_PIN) == LOW);
   const int n = (s100 ? 1 : 0) + (s1 ? 1 : 0) + (s10 ? 1 : 0);
-  if (n != 1) return 1;
-  if (s100) return 100;
-  if (s10) return 10;
-  return 1;
+  if (n != 1) return false;
+  if (s100) *out_mult = 100;
+  else if (s10) *out_mult = 10;
+  else *out_mult = 1;
+  return true;
+}
+
+static uint16_t readHandScaleMultiplier()
+{
+  static uint16_t stable = 1;
+  static uint16_t candidate = 1;
+  static uint32_t tStable = 0;
+
+  uint16_t raw = 1;
+  if (!readHandScaleMultiplierRaw(&raw)) return stable;
+
+  const uint32_t m = millis();
+  if (raw != candidate) {
+    candidate = raw;
+    tStable = m;
+  } else if ((m - tStable) >= 20 && candidate != stable) {
+    stable = candidate;
+  }
+  return stable;
 }
 
 static void handPulseOne(StepperJog& j, bool dirPlus)
@@ -1793,11 +1835,11 @@ static void updateHandWheelJog()
     return;
   }
 
+  const uint16_t scale_mult = readHandScaleMultiplier();
   int16_t d = handEncoderReadDelta();
   if (g_hand_encoder_invert_x && ax == HandAxisSel::X) d = (int16_t)-d;
   if (d != 0) {
-    const int mult = (int)readHandScaleMultiplier();
-    int32_t add = (int32_t)d * mult;
+    int32_t add = (int32_t)d * (int32_t)scale_mult;
     if (hand_q_axis != HandAxisSel::None && hand_q_axis != ax) {
       hand_q_steps = 0;
     }
