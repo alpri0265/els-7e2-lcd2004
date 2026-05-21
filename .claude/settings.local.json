@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pio --version 2>&1)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" --version)",
+      "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\.vscode\\\\extensions\\\\\" -ErrorAction SilentlyContinue | Select-Object Name | Where-Object { $_.Name -match \"platform\" })",
+      "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\AppData\" -ErrorAction SilentlyContinue | Select-Object Name)",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(e.get\\('identifier',{}\\).get\\('id',''\\), e.get\\('location',{}\\).get\\('path',''\\)\\) for e in data if 'platform' in str\\(e\\).lower\\(\\)]\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('version:', d.get\\('version'\\)\\); print\\('engine:', d.get\\('engines',{}\\)\\); print\\('main:', d.get\\('main'\\)\\)\")",
+      "PowerShell($code.Substring\\(1440, 100\\))"
+    ]
+  }
+}
