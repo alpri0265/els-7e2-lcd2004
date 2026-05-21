@@ -565,6 +565,18 @@ static uint16_t g_hand_scale_mult_disp = 1;
 static int16_t g_hand_dbg_d = 0;
 static int16_t g_hand_dbg_acc = 0;
 
+#ifndef SHOW_LINEAR_DRO_ON_LCD
+#define SHOW_LINEAR_DRO_ON_LCD 1
+#endif
+
+#if defined(STM32F407xx) && ENABLE_LINEAR_ENCODERS
+static int32_t g_lin_z_cnt_disp = 0;
+static int32_t g_lin_x_cnt_disp = 0;
+static int32_t g_lin_z_d_disp = 0;
+static int32_t g_lin_x_d_disp = 0;
+static bool g_lin_show_delta_disp = false;
+#endif
+
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
 static int16_t g_spindle_cnt_disp = 0;
 static uint16_t g_spindle_rpm_disp = 0;
@@ -759,8 +771,33 @@ static void makeRow1(char out[21])
 
 static void makeRow2(char out[21])
 {
-  // Show current/total passes
+#if defined(STM32F407xx) && ENABLE_LINEAR_ENCODERS && SHOW_LINEAR_DRO_ON_LCD
+  int32_t z = g_lin_z_cnt_disp;
+  int32_t x = g_lin_x_cnt_disp;
+  int32_t dz = g_lin_z_d_disp;
+  int32_t dx = g_lin_x_d_disp;
+  const int32_t lim = 99999;
+  if (z > lim) z = lim;
+  if (z < -lim) z = -lim;
+  if (x > lim) x = lim;
+  if (x < -lim) x = -lim;
+  if (dz > lim) dz = lim;
+  if (dz < -lim) dz = -lim;
+  if (dx > lim) dx = lim;
+  if (dx < -lim) dx = -lim;
+
+  if (current_mode == MODE_TACHO) {
+    if (g_lin_show_delta_disp) {
+      snprintf(out, 21, "dZ%+6ld dX%+6ld", (long)dz, (long)dx);
+    } else {
+      snprintf(out, 21, "DRO Z%+6ld X%+6ld", (long)z, (long)x);
+    }
+  } else {
+    snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
+  }
+#else
   snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
+#endif
 }
 
 static void makeRow3(char out[21])
@@ -1982,6 +2019,73 @@ static void spindleEncoderUiSnapshot()
 #endif
 }
 
+#if defined(STM32F407xx) && ENABLE_LINEAR_ENCODERS && SHOW_LINEAR_DRO_ON_LCD
+static void linearEncodersUiSnapshot()
+{
+  const int32_t z = linearEncodersCountsZ();
+  const int32_t x = linearEncodersCountsX();
+  g_lin_z_cnt_disp = z;
+  g_lin_x_cnt_disp = x;
+
+  static int32_t s_prev_z = 0;
+  static int32_t s_prev_x = 0;
+  static bool s_have_prev = false;
+  static int32_t s_acc_dz = 0;
+  static int32_t s_acc_dx = 0;
+  static uint32_t s_t0 = 0;
+
+  const uint32_t m = millis();
+  if (!s_have_prev) {
+    s_have_prev = true;
+    s_prev_z = z;
+    s_prev_x = x;
+    s_acc_dz = 0;
+    s_acc_dx = 0;
+    s_t0 = m;
+  } else {
+    const int32_t dz = z - s_prev_z;
+    const int32_t dx = x - s_prev_x;
+    s_prev_z = z;
+    s_prev_x = x;
+    s_acc_dz += dz;
+    s_acc_dx += dx;
+  }
+
+  if ((m - s_t0) >= 200u) {
+    g_lin_z_d_disp = s_acc_dz;
+    g_lin_x_d_disp = s_acc_dx;
+    s_acc_dz = 0;
+    s_acc_dx = 0;
+    s_t0 = m;
+  }
+
+  static uint32_t s_flip_t0 = 0;
+  if (s_flip_t0 == 0) s_flip_t0 = m;
+  if ((m - s_flip_t0) >= 900u) {
+    g_lin_show_delta_disp = !g_lin_show_delta_disp;
+    s_flip_t0 = m;
+  }
+
+  static int32_t s_last_z = INT32_MIN;
+  static int32_t s_last_x = INT32_MIN;
+  static int32_t s_last_dz = INT32_MIN;
+  static int32_t s_last_dx = INT32_MIN;
+  static bool s_last_show = false;
+  if (g_lin_z_cnt_disp != s_last_z || g_lin_x_cnt_disp != s_last_x ||
+      g_lin_z_d_disp != s_last_dz || g_lin_x_d_disp != s_last_dx ||
+      g_lin_show_delta_disp != s_last_show) {
+    s_last_z = g_lin_z_cnt_disp;
+    s_last_x = g_lin_x_cnt_disp;
+    s_last_dz = g_lin_z_d_disp;
+    s_last_dx = g_lin_x_d_disp;
+    s_last_show = g_lin_show_delta_disp;
+    cache_valid = false;
+  }
+}
+#else
+static void linearEncodersUiSnapshot() {}
+#endif
+
 #if ENABLE_SOFTWARE_LIMITS
 static uint8_t joyDirToAfeedJoy(JoyDir d)
 {
@@ -2743,6 +2847,7 @@ void setup()
   syncModeSubmodeNow();
   /* Підтягнути ручний енкодер / вісь / SCALE у g_* до першого малювання (інакше рядок 3 лишається . 1 0). */
   handEncoderUiSnapshot();
+  linearEncodersUiSnapshot();
   spindleEncoderUiSnapshot();
   updateDisplay(); // initial paint
 }
@@ -2753,6 +2858,7 @@ void loop()
   handEncoderPollQuad();
 #endif
   linearEncodersPoll();
+  linearEncodersUiSnapshot();
   handEncoderUiSnapshot();
   spindleEncoderUiSnapshot();
   updateSoftwareLimits();
