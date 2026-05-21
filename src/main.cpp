@@ -562,6 +562,20 @@ static HandAxisSel g_hand_axis_disp = HandAxisSel::None;
 /* TIM4 CNT — 16-біт беззнаковий; int16 каст давав дивний вигляд біля 32768. */
 static uint16_t g_hand_cnt_disp = 0;
 static uint16_t g_hand_scale_mult_disp = 1;
+static int16_t g_hand_dbg_d = 0;
+static int16_t g_hand_dbg_acc = 0;
+
+#ifndef SHOW_LINEAR_DRO_ON_LCD
+#define SHOW_LINEAR_DRO_ON_LCD 1
+#endif
+
+#if defined(STM32F407xx) && ENABLE_LINEAR_ENCODERS
+static int32_t g_lin_z_cnt_disp = 0;
+static int32_t g_lin_x_cnt_disp = 0;
+static int32_t g_lin_z_d_disp = 0;
+static int32_t g_lin_x_d_disp = 0;
+static bool g_lin_show_delta_disp = false;
+#endif
 
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
 static int16_t g_spindle_cnt_disp = 0;
@@ -720,23 +734,23 @@ static void makeRow1(char out[21])
 {
   switch (current_mode) {
     case MODE_FEED:
-      snprintf(out, 21, "FEED: %u.%02u mm/rev", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "FEED: %u.%02u mm/rev", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_AFEED:
-      snprintf(out, 21, "aFEED:%u.%02u mm/rev", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "aFEED:%u.%02u mm/rev", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_THREAD:
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
-      snprintf(out, 21, "STEP:%u.%02u S:%6d", feed_x100 / 100, feed_x100 % 100, (int)g_spindle_cnt_disp);
+      snprintf(out, 21, "STEP:%u.%02u S:%6d", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u), (int)g_spindle_cnt_disp);
 #else
-      snprintf(out, 21, "STEP: %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "STEP: %u.%02u mm", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
 #endif
       break;
     case MODE_CONE:
-      snprintf(out, 21, "CONE: %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "CONE: %u.%02u mm", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_SPHERE:
-      snprintf(out, 21, "R:    %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "R:    %u.%02u mm", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_TACHO:
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
@@ -757,8 +771,33 @@ static void makeRow1(char out[21])
 
 static void makeRow2(char out[21])
 {
-  // Show current/total passes
-  snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
+#if defined(STM32F407xx) && ENABLE_LINEAR_ENCODERS && SHOW_LINEAR_DRO_ON_LCD
+  int32_t z = g_lin_z_cnt_disp;
+  int32_t x = g_lin_x_cnt_disp;
+  int32_t dz = g_lin_z_d_disp;
+  int32_t dx = g_lin_x_d_disp;
+  const int32_t lim = 99999;
+  if (z > lim) z = lim;
+  if (z < -lim) z = -lim;
+  if (x > lim) x = lim;
+  if (x < -lim) x = -lim;
+  if (dz > lim) dz = lim;
+  if (dz < -lim) dz = -lim;
+  if (dx > lim) dx = lim;
+  if (dx < -lim) dx = -lim;
+
+  if (current_mode == MODE_TACHO) {
+    if (g_lin_show_delta_disp) {
+      snprintf(out, 21, "dZ%+6ld dX%+6ld", (long)dz, (long)dx);
+    } else {
+      snprintf(out, 21, "DRO Z%+6ld X%+6ld", (long)z, (long)x);
+    }
+  } else {
+    snprintf(out, 21, "PASS: %u/%u", (unsigned)pass_cur, (unsigned)pass_total);
+  }
+#else
+  snprintf(out, 21, "PASS: %u/%u", (unsigned)pass_cur, (unsigned)pass_total);
+#endif
 }
 
 static void makeRow3(char out[21])
@@ -786,7 +825,7 @@ static void makeSubmenuRow1(char out[21])
 
 static void makeSubmenuRow2(char out[21])
 {
-  snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
+  snprintf(out, 21, "PASS: %u/%u", (unsigned)pass_cur, (unsigned)pass_total);
 }
 
 static void makeSubmenuRow3(char out[21])
@@ -1101,21 +1140,20 @@ static void jogSetDir(StepperJog& j, bool dirLogical)
   writePolarityPin(j.dirPin, dirLogical, DIR_ACTIVE_LOW);
 }
 
-static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t stepIntervalUs)
+static bool jogUpdateStep(StepperJog& j, bool wantMove, bool dirLogical, uint32_t stepIntervalUs, bool checkLimits)
 {
   const uint32_t now = micros();
 
   if (!wantMove || stepIntervalUs == 0) {
     jogSetEnabled(j, false);
-    return;
+    return false;
   }
 
   jogSetEnabled(j, true);
   const bool dirChanged = (j.dir != dirLogical);
   jogSetDir(j, dirLogical);
   if (dirChanged) {
-    // DM556 family typically wants >=5us DIR setup before a PUL active edge.
-    static constexpr uint32_t DIR_SETUP_US = 6;
+    static constexpr uint32_t DIR_SETUP_US = 20;
     j.dirSetupPending = true;
     j.dirSetupUntilUs = now + DIR_SETUP_US;
     // Also restart step scheduling after a DIR change.
@@ -1123,14 +1161,15 @@ static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t st
     j.nextStepAtUs = now;
   }
 
-  // STEP pulse width (active) for opto inputs: keep >= 5us.
-  static constexpr uint32_t PULSE_US = 6;
+  static constexpr uint32_t PULSE_US = 10;
 
   // Turn STEP off when pulse time elapses
   if (j.stepIsActive && (int32_t)(now - j.stepOffAtUs) >= 0) {
     j.stepIsActive = false;
     writePolarityPin(j.stepPin, false, STEP_ACTIVE_LOW);
   }
+
+  bool stepEmitted = false;
 
   // Schedule new step
   if (!j.stepIsActive && (int32_t)(now - j.nextStepAtUs) >= 0) {
@@ -1141,15 +1180,15 @@ static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t st
       if (j.dirSetupPending) j.dirSetupPending = false;
 #if ENABLE_SOFTWARE_LIMITS
       if (&j == &jogZ) {
-        if (!softLimitAllowsZ(dirLogical)) {
+        if (checkLimits && !softLimitAllowsZ(dirLogical)) {
           jogSetEnabled(j, false);
-          return;
+          return false;
         }
         motor_z_steps += dirLogical ? 1 : -1;
       } else if (&j == &jogX) {
-        if (!softLimitAllowsX(dirLogical)) {
+        if (checkLimits && !softLimitAllowsX(dirLogical)) {
           jogSetEnabled(j, false);
-          return;
+          return false;
         }
         motor_x_steps += dirLogical ? 1 : -1;
       }
@@ -1158,8 +1197,15 @@ static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t st
       writePolarityPin(j.stepPin, true, STEP_ACTIVE_LOW);
       j.stepOffAtUs = now + PULSE_US;
       j.nextStepAtUs = now + stepIntervalUs;
+      stepEmitted = true;
     }
   }
+  return stepEmitted;
+}
+
+static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t stepIntervalUs)
+{
+  (void)jogUpdateStep(j, wantMove, dirLogical, stepIntervalUs, true);
 }
 
 #if ENABLE_SOFTWARE_LIMITS
@@ -1800,82 +1846,83 @@ static void handPulseOne(StepperJog& j, bool dirPlus)
 
 static void updateHandWheelJog()
 {
-  static int32_t hand_q_steps = 0;
-  static HandAxisSel hand_q_axis = HandAxisSel::None;
-  static uint32_t hand_next_us = 0;
+  static int32_t hand_steps = 0;
+  static HandAxisSel hand_axis = HandAxisSel::None;
+
+  auto reset = [&](bool disableJogs) {
+    hand_steps = 0;
+    hand_axis = HandAxisSel::None;
+    g_hand_dbg_d = 0;
+    g_hand_dbg_acc = 0;
+    if (disableJogs) {
+      jogSetEnabled(jogZ, false);
+      jogSetEnabled(jogX, false);
+    }
+  };
 
   if (motionInhibited()) {
-    hand_q_steps = 0;
-    hand_q_axis = HandAxisSel::None;
-    hand_next_us = 0;
+    reset(true);
     return;
   }
 
 #if ENABLE_SOFTWARE_LIMITS
   if (els_afeed::isBusy()) {
-    hand_q_steps = 0;
-    hand_q_axis = HandAxisSel::None;
-    hand_next_us = 0;
+    reset(true);
     return;
   }
 #endif
 
   if (joy_dir != JoyDir::None) {
-    hand_q_steps = 0;
-    hand_q_axis = HandAxisSel::None;
-    hand_next_us = 0;
+    reset(false);
     return;
   }
 
   const HandAxisSel ax = readHandAxisDebounced();
   if (ax == HandAxisSel::None) {
-    hand_q_steps = 0;
-    hand_q_axis = HandAxisSel::None;
-    hand_next_us = 0;
+    reset(true);
     return;
   }
 
   const uint16_t scale_mult = readHandScaleMultiplier();
   int16_t d = handEncoderReadDelta();
   if (g_hand_encoder_invert_x && ax == HandAxisSel::X) d = (int16_t)-d;
+
+  g_hand_dbg_d = d;
+
+  if (hand_axis != HandAxisSel::None && hand_axis != ax) {
+    hand_steps = 0;
+    jogSetEnabled(jogZ, false);
+    jogSetEnabled(jogX, false);
+  }
+  hand_axis = ax;
+
   if (d != 0) {
-    int32_t add = (int32_t)d * (int32_t)scale_mult;
-    if (hand_q_axis != HandAxisSel::None && hand_q_axis != ax) {
-      hand_q_steps = 0;
-    }
-    hand_q_axis = ax;
-    /* РГИ / електронний маховик: ігноруємо програмні ліміти (вимір, виїзд за упор). */
-    hand_q_steps += add;
+    const int32_t add = (int32_t)d * (int32_t)scale_mult;
+    hand_steps += add;
+    int32_t lim = 800;
+    if (scale_mult == 10) lim = 2500;
+    else if (scale_mult == 100) lim = 6000;
+    if (hand_steps > lim) hand_steps = lim;
+    if (hand_steps < -lim) hand_steps = -lim;
   }
 
-  if (hand_q_steps == 0) {
-    hand_next_us = 0;
+  if (hand_steps == 0) {
+    g_hand_dbg_acc = 0;
     return;
   }
 
-  const bool forward = hand_q_steps > 0;
+  const bool forward = hand_steps > 0;
+  uint32_t intervalUs = 900;
+  if (scale_mult == 10) intervalUs = 1400;
+  else if (scale_mult == 100) intervalUs = 2200;
 
-  // Min. interval from *real* time after each pulse. Slower at ×10 / ×100 so the motor
-  // keeps up (burst "catch-up" with the old scheduler could fire dozens of steps ~20µs
-  // apart → stall / lost steps).
-  // Hand-wheel step period (one step per loop when due). ×100 still below burst rates
-  // that caused stalls; tune here if you need more speed vs reliability.
-  auto handPeriodUs = []() -> uint32_t {
-    switch (readHandScaleMultiplier()) {
-      case 100: return 700;
-      case 10:  return 600;
-      default:  return 500;
-    }
-  };
-
-  const uint32_t now = micros();
-  if (hand_next_us == 0) hand_next_us = now;
-  if ((int32_t)(now - hand_next_us) < 0) return;
-
-  StepperJog& j = (hand_q_axis == HandAxisSel::Z) ? jogZ : jogX;
-  handPulseOne(j, forward);
-  hand_q_steps += forward ? -1 : 1;
-  hand_next_us = micros() + handPeriodUs();
+  StepperJog& j = (hand_axis == HandAxisSel::Z) ? jogZ : jogX;
+  if (jogUpdateStep(j, true, forward, intervalUs, false)) {
+    hand_steps += forward ? -1 : 1;
+  }
+  if (hand_steps > 32767) g_hand_dbg_acc = 32767;
+  else if (hand_steps < -32768) g_hand_dbg_acc = -32768;
+  else g_hand_dbg_acc = (int16_t)hand_steps;
 }
 
 static void handEncoderUiSnapshot()
@@ -1953,7 +2000,7 @@ static void spindleEncoderUiSnapshot()
   if (dt >= 200u) {
     const int64_t acc_abs = s_sp_acc >= 0 ? (int64_t)s_sp_acc : -(int64_t)s_sp_acc;
     uint32_t rpm = 0;
-    if (g_spindle_ticks_per_rev > 0u && dt > 0u)
+    if (g_spindle_ticks_per_rev > 0u)
       rpm = (uint32_t)((acc_abs * 60000ULL) / (uint64_t)g_spindle_ticks_per_rev / (uint64_t)dt);
     if (rpm > 9999u) rpm = 9999u;
     g_spindle_rpm_disp = (uint16_t)rpm;
@@ -1971,6 +2018,73 @@ static void spindleEncoderUiSnapshot()
   (void)0;
 #endif
 }
+
+#if defined(STM32F407xx) && ENABLE_LINEAR_ENCODERS && SHOW_LINEAR_DRO_ON_LCD
+static void linearEncodersUiSnapshot()
+{
+  const int32_t z = linearEncodersCountsZ();
+  const int32_t x = linearEncodersCountsX();
+  g_lin_z_cnt_disp = z;
+  g_lin_x_cnt_disp = x;
+
+  static int32_t s_prev_z = 0;
+  static int32_t s_prev_x = 0;
+  static bool s_have_prev = false;
+  static int32_t s_acc_dz = 0;
+  static int32_t s_acc_dx = 0;
+  static uint32_t s_t0 = 0;
+
+  const uint32_t m = millis();
+  if (!s_have_prev) {
+    s_have_prev = true;
+    s_prev_z = z;
+    s_prev_x = x;
+    s_acc_dz = 0;
+    s_acc_dx = 0;
+    s_t0 = m;
+  } else {
+    const int32_t dz = z - s_prev_z;
+    const int32_t dx = x - s_prev_x;
+    s_prev_z = z;
+    s_prev_x = x;
+    s_acc_dz += dz;
+    s_acc_dx += dx;
+  }
+
+  if ((m - s_t0) >= 200u) {
+    g_lin_z_d_disp = s_acc_dz;
+    g_lin_x_d_disp = s_acc_dx;
+    s_acc_dz = 0;
+    s_acc_dx = 0;
+    s_t0 = m;
+  }
+
+  static uint32_t s_flip_t0 = 0;
+  if (s_flip_t0 == 0) s_flip_t0 = m;
+  if ((m - s_flip_t0) >= 900u) {
+    g_lin_show_delta_disp = !g_lin_show_delta_disp;
+    s_flip_t0 = m;
+  }
+
+  static int32_t s_last_z = INT32_MIN;
+  static int32_t s_last_x = INT32_MIN;
+  static int32_t s_last_dz = INT32_MIN;
+  static int32_t s_last_dx = INT32_MIN;
+  static bool s_last_show = false;
+  if (g_lin_z_cnt_disp != s_last_z || g_lin_x_cnt_disp != s_last_x ||
+      g_lin_z_d_disp != s_last_dz || g_lin_x_d_disp != s_last_dx ||
+      g_lin_show_delta_disp != s_last_show) {
+    s_last_z = g_lin_z_cnt_disp;
+    s_last_x = g_lin_x_cnt_disp;
+    s_last_dz = g_lin_z_d_disp;
+    s_last_dx = g_lin_x_d_disp;
+    s_last_show = g_lin_show_delta_disp;
+    cache_valid = false;
+  }
+}
+#else
+static void linearEncodersUiSnapshot() {}
+#endif
 
 #if ENABLE_SOFTWARE_LIMITS
 static uint8_t joyDirToAfeedJoy(JoyDir d)
@@ -2733,6 +2847,7 @@ void setup()
   syncModeSubmodeNow();
   /* Підтягнути ручний енкодер / вісь / SCALE у g_* до першого малювання (інакше рядок 3 лишається . 1 0). */
   handEncoderUiSnapshot();
+  linearEncodersUiSnapshot();
   spindleEncoderUiSnapshot();
   updateDisplay(); // initial paint
 }
@@ -2743,6 +2858,7 @@ void loop()
   handEncoderPollQuad();
 #endif
   linearEncodersPoll();
+  linearEncodersUiSnapshot();
   handEncoderUiSnapshot();
   spindleEncoderUiSnapshot();
   updateSoftwareLimits();
