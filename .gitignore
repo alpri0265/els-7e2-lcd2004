@@ -13,8 +13,11 @@ Desktop.ini
 *~
 .vscode/
 .idea/
+.claude/
 
 # PlatformIO
 .pio/
 .pioenvs/
 .piolibdeps/
+# PlatformIO external build directory (build_dir in platformio.ini)
+pio_build/
