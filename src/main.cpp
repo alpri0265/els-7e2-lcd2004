@@ -734,23 +734,23 @@ static void makeRow1(char out[21])
 {
   switch (current_mode) {
     case MODE_FEED:
-      snprintf(out, 21, "FEED: %u.%02u mm/rev", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "FEED: %u.%02u mm/rev", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_AFEED:
-      snprintf(out, 21, "aFEED:%u.%02u mm/rev", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "aFEED:%u.%02u mm/rev", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_THREAD:
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
-      snprintf(out, 21, "STEP:%u.%02u S:%6d", feed_x100 / 100, feed_x100 % 100, (int)g_spindle_cnt_disp);
+      snprintf(out, 21, "STEP:%u.%02u S:%6d", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u), (int)g_spindle_cnt_disp);
 #else
-      snprintf(out, 21, "STEP: %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "STEP: %u.%02u mm", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
 #endif
       break;
     case MODE_CONE:
-      snprintf(out, 21, "CONE: %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "CONE: %u.%02u mm", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_SPHERE:
-      snprintf(out, 21, "R:    %u.%02u mm", feed_x100 / 100, feed_x100 % 100);
+      snprintf(out, 21, "R:    %u.%02u mm", (unsigned)(feed_x100 / 100u), (unsigned)(feed_x100 % 100u));
       break;
     case MODE_TACHO:
 #if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
@@ -793,10 +793,10 @@ static void makeRow2(char out[21])
       snprintf(out, 21, "DRO Z%+6ld X%+6ld", (long)z, (long)x);
     }
   } else {
-    snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
+    snprintf(out, 21, "PASS: %u/%u", (unsigned)pass_cur, (unsigned)pass_total);
   }
 #else
-  snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
+  snprintf(out, 21, "PASS: %u/%u", (unsigned)pass_cur, (unsigned)pass_total);
 #endif
 }
 
@@ -825,7 +825,7 @@ static void makeSubmenuRow1(char out[21])
 
 static void makeSubmenuRow2(char out[21])
 {
-  snprintf(out, 21, "PASS: %u/%u", pass_cur, pass_total);
+  snprintf(out, 21, "PASS: %u/%u", (unsigned)pass_cur, (unsigned)pass_total);
 }
 
 static void makeSubmenuRow3(char out[21])
@@ -2000,7 +2000,7 @@ static void spindleEncoderUiSnapshot()
   if (dt >= 200u) {
     const int64_t acc_abs = s_sp_acc >= 0 ? (int64_t)s_sp_acc : -(int64_t)s_sp_acc;
     uint32_t rpm = 0;
-    if (g_spindle_ticks_per_rev > 0u && dt > 0u)
+    if (g_spindle_ticks_per_rev > 0u)
       rpm = (uint32_t)((acc_abs * 60000ULL) / (uint64_t)g_spindle_ticks_per_rev / (uint64_t)dt);
     if (rpm > 9999u) rpm = 9999u;
     g_spindle_rpm_disp = (uint16_t)rpm;

@@ -2,6 +2,9 @@
 
 #if ENABLE_LINEAR_ENCODERS && defined(STM32F407xx)
 
+#include "stm32f4xx_ll_bus.h"
+#include "stm32f4xx_ll_gpio.h"
+
 /* CubeMX / pinout.md */
 static constexpr uint8_t PIN_LIN_Z_A = PE0;
 static constexpr uint8_t PIN_LIN_Z_B = PE1;
