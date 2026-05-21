@@ -7,6 +7,18 @@
 
 namespace els_afeed {
 
+struct Hardware
+{
+  int32_t rebound_x;
+  int32_t rebound_z;
+  int32_t motor_x_steps_per_rev;
+  int32_t screw_x_hundredths;
+  int32_t mcstep_x;
+  int32_t tol;
+};
+
+void setHardware(const Hardware& hw);
+
 bool isBusy();
 
 /* aFEED INT/EXT: joystick axes that start async cycles must not run manual Z/X jog (Menu.ino). */

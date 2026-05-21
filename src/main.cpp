@@ -218,6 +218,14 @@ static void hwApplyDerived()
   if (g_spindle_ticks_per_rev == 0u) g_spindle_ticks_per_rev = 1u;
   g_hand_encoder_invert_x = (g_hw.hc_x_dir != 0u);
   g_limit_gap_steps = (uint32_t)((uint32_t)g_hw.rapid_span * (uint32_t)MCSTEP_Z_SOFT * 2u);
+#if ENABLE_SOFTWARE_LIMITS
+  els_afeed::setHardware({(int32_t)g_hw.rebound_x,
+                          (int32_t)g_hw.rebound_z,
+                          (int32_t)g_hw.motor_x_steps_per_rev,
+                          (int32_t)g_hw.screw_x_hundredths,
+                          (int32_t)g_hw.mcstep_x,
+                          56});
+#endif
 }
 
 static void hwClamp()
@@ -682,6 +690,12 @@ static void applySelectionMarker(uint8_t row, char s[21])
 
 static uint8_t hwStepMulIdx = 0;
 static constexpr uint16_t kHwStepMul[3] = {1, 10, 100};
+static uint8_t reserve_page = 0;
+static uint8_t reserve_cal_page = 0;
+
+static float axisStepsPerMmZ();
+static float axisStepsPerMmX();
+static uint32_t jogMmPerMinFromKnob(uint16_t fx100);
 
 static void makeHwHeader(char out[21])
 {
@@ -689,10 +703,60 @@ static void makeHwHeader(char out[21])
   if ((int32_t)(now - g_hw_saved_banner_until_ms) < 0) {
     snprintf(out, 21, "HW SAVED");
   } else {
-    snprintf(out, 21, "HW SET x%u %c",
-             (unsigned)kHwStepMul[hwStepMulIdx],
-             g_hw_dirty ? '*' : ' ');
+    if (reserve_page == 0) {
+      snprintf(out, 21, "HW SET x%u%c SEL=CAL",
+               (unsigned)kHwStepMul[hwStepMulIdx],
+               g_hw_dirty ? '*' : ' ');
+    } else {
+      snprintf(out, 21, "CAL %u/2 SEL=HW",
+               (unsigned)(reserve_cal_page + 1u));
+    }
   }
+}
+
+static void makeReserveCalRows(char rows[4][21])
+{
+  const uint32_t cur_mm_min = jogMmPerMinFromKnob(feed_x100);
+  const uint32_t min_mm_min = (uint32_t)g_hw.min_feed;
+  const uint32_t max_mm_min = (uint32_t)g_hw.max_feed;
+  const uint32_t z_spmm = (uint32_t)lroundf(axisStepsPerMmZ());
+  const uint32_t x_spmm = (uint32_t)lroundf(axisStepsPerMmX());
+
+  if (reserve_cal_page == 0) {
+    snprintf(rows[0], 21, "CAL MECH 1/2 SEL");
+    snprintf(rows[1], 21, "Z st/mm %6lu", (unsigned long)z_spmm);
+    snprintf(rows[2], 21, "X st/mm %6lu", (unsigned long)x_spmm);
+    snprintf(rows[3], 21, "JOG %3lu-%3lu C%3lu",
+             (unsigned long)min_mm_min, (unsigned long)max_mm_min, (unsigned long)cur_mm_min);
+    return;
+  }
+
+  const uint32_t tpr = g_spindle_ticks_per_rev;
+  const uint32_t pitch_z_100 = (uint32_t)g_hw.screw_z_hundredths;
+  const uint32_t pitch_x_100 = (uint32_t)g_hw.screw_x_hundredths;
+
+  uint32_t zt_i = 0, zt_f = 0, xt_i = 0, xt_f = 0;
+  if (tpr > 0 && pitch_z_100 > 0) {
+    const float zt = axisStepsPerMmZ() * ((float)feed_x100 / 100.0f) / (float)tpr;
+    const float zta = fabsf(zt);
+    zt_i = (uint32_t)zta;
+    zt_f = (uint32_t)lroundf((zta - (float)zt_i) * 1000.0f);
+    if (zt_f > 999u) { zt_f = 0; zt_i++; }
+  }
+  if (tpr > 0 && pitch_x_100 > 0) {
+    const float xt = axisStepsPerMmX() * ((float)feed_x100 / 100.0f) / (float)tpr;
+    const float xta = fabsf(xt);
+    xt_i = (uint32_t)xta;
+    xt_f = (uint32_t)lroundf((xta - (float)xt_i) * 1000.0f);
+    if (xt_f > 999u) { xt_f = 0; xt_i++; }
+  }
+
+  snprintf(rows[0], 21, "CAL SYNC 2/2 SEL");
+  snprintf(rows[1], 21, "ENC t/rev %5lu", (unsigned long)tpr);
+  snprintf(rows[2], 21, "Zt%lu.%03lu Xt%lu.%03lu",
+           (unsigned long)zt_i, (unsigned long)zt_f, (unsigned long)xt_i, (unsigned long)xt_f);
+  snprintf(rows[3], 21, "HC1%3u HC10%3u X%u",
+           (unsigned)g_hw.hc_scale_1, (unsigned)g_hw.hc_scale_10, (unsigned)g_hw.hc_x_dir);
 }
 
 static void makeHwItemRow(uint8_t slot, char out[21])
@@ -874,11 +938,19 @@ static void updateDisplay()
   char rows[4][21];
 
   if (current_mode == MODE_RESERVE) {
-    if (selected_row < 1 || selected_row > 3) selected_row = 1;
-    makeHwHeader(rows[0]); padTo20(rows[0]); applySelectionMarker(0, rows[0]);
-    makeHwItemRow(0, rows[1]); padTo20(rows[1]); applySelectionMarker(1, rows[1]);
-    makeHwItemRow(1, rows[2]); padTo20(rows[2]); applySelectionMarker(2, rows[2]);
-    makeHwItemRow(2, rows[3]); padTo20(rows[3]); applySelectionMarker(3, rows[3]);
+    if (reserve_page == 0) {
+      if (selected_row > 3) selected_row = 1;
+      makeHwHeader(rows[0]); padTo20(rows[0]); applySelectionMarker(0, rows[0]);
+      makeHwItemRow(0, rows[1]); padTo20(rows[1]); applySelectionMarker(1, rows[1]);
+      makeHwItemRow(1, rows[2]); padTo20(rows[2]); applySelectionMarker(2, rows[2]);
+      makeHwItemRow(2, rows[3]); padTo20(rows[3]); applySelectionMarker(3, rows[3]);
+    } else {
+      makeReserveCalRows(rows);
+      padTo20(rows[0]);
+      padTo20(rows[1]);
+      padTo20(rows[2]);
+      padTo20(rows[3]);
+    }
   } else if (!in_submenu) {
     makeRow0(rows[0]); padTo20(rows[0]); applySelectionMarker(0, rows[0]);
     makeRow1(rows[1]); padTo20(rows[1]); applySelectionMarker(1, rows[1]);
@@ -1098,14 +1170,46 @@ static void stepperInitPins()
   writePolarityPin(X_STEP_PIN, false, STEP_ACTIVE_LOW);
 }
 
-static uint32_t feedToStepsPerSecond(uint16_t fx100, bool rapid)
+static float axisStepsPerMmZ()
 {
-  // Simple mapping for manual jog:
-  // fx100 (5..999) -> base speed (80..2500 steps/s)
-  const uint32_t minSps = 80;
-  const uint32_t maxSps = 2500;
-  const uint32_t sps = minSps + (uint32_t)(maxSps - minSps) * (uint32_t)fx100 / 999U;
-  return rapid ? (sps * 3U) : sps;
+  const float screw_mm = (float)g_hw.screw_z_hundredths / 100.0f;
+  if (screw_mm <= 0.0f) return 0.0f;
+  return ((float)g_hw.motor_z_steps_per_rev * (float)g_hw.mcstep_z) / screw_mm;
+}
+
+static float axisStepsPerMmX()
+{
+  const float screw_mm = (float)g_hw.screw_x_hundredths / 100.0f;
+  if (screw_mm <= 0.0f) return 0.0f;
+  return ((float)g_hw.motor_x_steps_per_rev * (float)g_hw.mcstep_x) / screw_mm;
+}
+
+static uint32_t jogMmPerMinFromKnob(uint16_t fx100)
+{
+  const uint16_t minv = (uint16_t)g_hw.min_feed;
+  const uint16_t maxv = (uint16_t)g_hw.max_feed;
+  if (maxv <= minv) return (uint32_t)minv;
+  const uint16_t kMin = 5;
+  const uint16_t kMax = 999;
+  uint16_t x = fx100;
+  if (x < kMin) x = kMin;
+  if (x > kMax) x = kMax;
+  const uint32_t span = (uint32_t)(maxv - minv);
+  const uint32_t t = (uint32_t)(x - kMin);
+  const uint32_t denom = (uint32_t)(kMax - kMin);
+  return (uint32_t)minv + (span * t) / denom;
+}
+
+static uint32_t jogStepsPerSecond(bool axisZ, uint16_t fx100, bool rapid)
+{
+  const float stepsPerMm = axisZ ? axisStepsPerMmZ() : axisStepsPerMmX();
+  if (stepsPerMm <= 0.0f) return 0;
+  const uint32_t mmPerMin = jogMmPerMinFromKnob(fx100);
+  float sps_f = stepsPerMm * ((float)mmPerMin / 60.0f);
+  if (rapid) sps_f *= 3.0f;
+  if (sps_f < 0.0f) sps_f = 0.0f;
+  if (sps_f > 25000.0f) sps_f = 25000.0f;
+  return (uint32_t)lroundf(sps_f);
 }
 
 #if ENABLE_SOFTWARE_LIMITS
@@ -1208,6 +1312,35 @@ static void jogUpdate(StepperJog& j, bool wantMove, bool dirLogical, uint32_t st
   (void)jogUpdateStep(j, wantMove, dirLogical, stepIntervalUs, true);
 }
 
+static bool syncPulseOne(StepperJog& j, bool axisZ, bool dirPlus, bool checkLimits)
+{
+#if ENABLE_SOFTWARE_LIMITS
+  if (checkLimits) {
+    if (axisZ) {
+      if (!softLimitAllowsZ(dirPlus)) return false;
+      motor_z_steps += dirPlus ? 1 : -1;
+    } else {
+      if (!softLimitAllowsX(dirPlus)) return false;
+      motor_x_steps += dirPlus ? 1 : -1;
+    }
+  } else {
+    if (axisZ) motor_z_steps += dirPlus ? 1 : -1;
+    else motor_x_steps += dirPlus ? 1 : -1;
+  }
+#else
+  (void)checkLimits;
+  if (axisZ) (void)0;
+#endif
+
+  const bool dirChanged = (j.dir != dirPlus);
+  jogSetDir(j, dirPlus);
+  if (dirChanged) delayMicroseconds(20);
+  writePolarityPin(j.stepPin, true, STEP_ACTIVE_LOW);
+  delayMicroseconds(10);
+  writePolarityPin(j.stepPin, false, STEP_ACTIVE_LOW);
+  return true;
+}
+
 #if ENABLE_SOFTWARE_LIMITS
 static void beeperTrigger(uint16_t duration_ms);
 
@@ -1283,7 +1416,9 @@ static bool joyNeutralForTeach()
 /* Мінімальна відстань між парними лімітами (кроки) ≈ розгін + гальмування для поточної подачі. */
 static uint32_t limitMinCorridorStepsForFeed(bool forRapidSpeed)
 {
-  const uint32_t sps = feedToStepsPerSecond(feed_x100, forRapidSpeed);
+  const uint32_t spsZ = jogStepsPerSecond(true, feed_x100, forRapidSpeed);
+  const uint32_t spsX = jogStepsPerSecond(false, feed_x100, forRapidSpeed);
+  const uint32_t sps = (spsZ > spsX) ? spsZ : spsX;
   uint32_t d = (sps * LIMIT_ACCEL_DECEL_MS) / 1000U;
   if (d < g_limit_gap_steps) d = g_limit_gap_steps;
   return d;
@@ -2112,7 +2247,7 @@ static int32_t manAfeedDocToXSteps(uint16_t doc100)
 /* Швидкість шатла Z у MAN: не залежить лише від лінійної карти горщика; підняті підлога/стеля. */
 static uint32_t manAfeedZShuttleSps(uint16_t fx100)
 {
-  uint32_t sps = feedToStepsPerSecond(fx100, true);
+  uint32_t sps = jogStepsPerSecond(true, fx100, true);
   if (sps < 1800U)
     sps = 1800U;
   if (sps > 10000U)
@@ -2126,14 +2261,101 @@ static void updateStepperJog()
   // Keep motion direction in sync with debounced joystick reading (потрібно і для раннього return).
   joy_dir = debouncedJoystickDir();
 
-  /* Джойстик у FEED/THREAD прив'язаний до кроку шпинделя; ручне колесо (РГІ) — ні: інакше при ×1 «нема руху». */
+#if defined(STM32F407xx) && ENABLE_SPINDLE_ENCODER
   if (current_mode == MODE_THREAD || current_mode == MODE_FEED) {
-    if (!spindle_step_flag) {
+    static bool s_sp_inited = false;
+    static uint16_t s_sp_prev = 0;
+    static int64_t s_rem_z = 0;
+    static int64_t s_rem_x = 0;
+    static uint32_t s_sig = 0;
+
+    const uint16_t c = (uint16_t)LL_TIM_GetCounter(TIM3);
+    int16_t dt = 0;
+    if (!s_sp_inited) {
+      s_sp_inited = true;
+      s_sp_prev = c;
+    } else {
+      dt = (int16_t)(c - s_sp_prev);
+      s_sp_prev = c;
+    }
+#if SPINDLE_ENCODER_INVERT
+    dt = (int16_t)-dt;
+#endif
+
+    const uint32_t sig = ((uint32_t)feed_x100 << 16) ^ (rapid_enabled ? 0xA5A50000u : 0u) ^
+                         (uint32_t)g_spindle_ticks_per_rev ^ (uint32_t)g_hw.motor_z_steps_per_rev ^
+                         (uint32_t)g_hw.screw_z_hundredths ^ (uint32_t)g_hw.mcstep_z ^
+                         (uint32_t)g_hw.motor_x_steps_per_rev ^ (uint32_t)g_hw.screw_x_hundredths ^
+                         (uint32_t)g_hw.mcstep_x;
+    if (sig != s_sig) {
+      s_sig = sig;
+      s_rem_z = 0;
+      s_rem_x = 0;
+    }
+
+    if (dt == 0) {
       updateHandWheelJog();
       return;
     }
-    spindle_step_flag = false;
+
+    bool wantZ = false, wantX = false;
+    bool zDir = false, xDir = false;
+    switch (joy_dir) {
+      case JoyDir::Left:  wantZ = true; zDir = false; break;
+      case JoyDir::Right: wantZ = true; zDir = true;  break;
+      case JoyDir::Up:    wantX = true; xDir = true;  break;
+      case JoyDir::Down:  wantX = true; xDir = false; break;
+      default: break;
+    }
+
+    if (motionInhibited()) {
+      wantZ = false;
+      wantX = false;
+    }
+
+    const int32_t abs_dt = (dt >= 0) ? (int32_t)dt : (int32_t)-dt;
+    const bool sp_dir_plus = (dt >= 0);
+
+    if (wantZ) {
+      const int64_t denom = (int64_t)g_hw.screw_z_hundredths * (int64_t)g_spindle_ticks_per_rev;
+      int64_t num = (int64_t)g_hw.motor_z_steps_per_rev * (int64_t)g_hw.mcstep_z * (int64_t)feed_x100;
+      if (rapid_enabled) num *= 3;
+      if (denom > 0 && num > 0) {
+        s_rem_z += (int64_t)abs_dt * num;
+        int64_t n = s_rem_z / denom;
+        s_rem_z = s_rem_z % denom;
+        if (n > 128) n = 128;
+        const bool dirPlus = zDir ^ (!sp_dir_plus);
+        for (int64_t i = 0; i < n; i++) {
+          if (!syncPulseOne(jogZ, true, dirPlus, true)) break;
+        }
+      }
+    } else {
+      s_rem_z = 0;
+    }
+
+    if (wantX) {
+      const int64_t denom = (int64_t)g_hw.screw_x_hundredths * (int64_t)g_spindle_ticks_per_rev;
+      int64_t num = (int64_t)g_hw.motor_x_steps_per_rev * (int64_t)g_hw.mcstep_x * (int64_t)feed_x100;
+      if (rapid_enabled) num *= 3;
+      if (denom > 0 && num > 0) {
+        s_rem_x += (int64_t)abs_dt * num;
+        int64_t n = s_rem_x / denom;
+        s_rem_x = s_rem_x % denom;
+        if (n > 128) n = 128;
+        const bool dirPlus = xDir ^ (!sp_dir_plus);
+        for (int64_t i = 0; i < n; i++) {
+          if (!syncPulseOne(jogX, false, dirPlus, true)) break;
+        }
+      }
+    } else {
+      s_rem_x = 0;
+    }
+
+    updateHandWheelJog();
+    return;
   }
+#endif
 
 #if ENABLE_SOFTWARE_LIMITS
   const bool afeed_man =
@@ -2249,9 +2471,13 @@ static void updateStepperJog()
   }
 
   bool awz = false, awx = false, aZd = false, aXd = false, zrap = false, xrap = false;
-  const uint32_t spsFeedOnly = feedToStepsPerSecond(feed_x100, false);
+  const uint32_t spsFeedZ = jogStepsPerSecond(true, feed_x100, false);
+  const uint32_t spsFeedX = jogStepsPerSecond(false, feed_x100, false);
+  const uint32_t spsFeedOnly = (spsFeedZ > spsFeedX) ? spsFeedZ : spsFeedX;
   const uint32_t intervalUs = (spsFeedOnly == 0) ? 0 : (1000000UL / spsFeedOnly);
-  const uint32_t spsRapOnly = feedToStepsPerSecond(feed_x100, true);
+  const uint32_t spsRapZ = jogStepsPerSecond(true, feed_x100, true);
+  const uint32_t spsRapX = jogStepsPerSecond(false, feed_x100, true);
+  const uint32_t spsRapOnly = (spsRapZ > spsRapX) ? spsRapZ : spsRapX;
   const uint32_t intervalRapidUs = (spsRapOnly == 0) ? 0 : (1000000UL / spsRapOnly);
   const uint32_t afeedIvFeed = (intervalUs == 0) ? 400U : intervalUs;
   const uint32_t afeedIvRap = (intervalRapidUs == 0) ? 200U : intervalRapidUs;
@@ -2326,8 +2552,8 @@ static void updateStepperJog()
 
   const bool rapidZ = rapid_enabled && (!wantZ || softLimitRapidAllowsZ(zDir));
   const bool rapidX = rapid_enabled && (!wantX || softLimitRapidAllowsX(xDir));
-  const uint32_t spsZ = feedToStepsPerSecond(feed_x100, rapidZ);
-  const uint32_t spsX = feedToStepsPerSecond(feed_x100, rapidX);
+  const uint32_t spsZ = jogStepsPerSecond(true, feed_x100, rapidZ);
+  const uint32_t spsX = jogStepsPerSecond(false, feed_x100, rapidX);
   const uint32_t intervalZ = (spsZ == 0) ? 0 : (1000000UL / spsZ);
   const uint32_t intervalX = (spsX == 0) ? 0 : (1000000UL / spsX);
 
@@ -2369,16 +2595,58 @@ static void applyKeyPress(uint8_t key, bool isRepeat = false)
 {
   if (current_mode == MODE_RESERVE) {
     const uint8_t count = (uint8_t)(sizeof(kHwItems) / sizeof(kHwItems[0]));
-    const uint8_t selSlot = (selected_row < 1) ? 0 : (uint8_t)(selected_row - 1);
-    const uint8_t selIdx = (uint8_t)(hw_top + selSlot);
+    const bool selIsItem = selected_row >= 1 && selected_row <= 3;
+    const uint8_t selSlot = selIsItem ? (uint8_t)(selected_row - 1) : 0;
+    const uint8_t selIdx = selIsItem ? (uint8_t)(hw_top + selSlot) : 0xFF;
+
+    if (reserve_page != 0) {
+      switch (key) {
+        case KEY_SEL:
+          reserve_page = 0;
+          reserve_cal_page = 0;
+          if (selected_row > 3) selected_row = 1;
+          break;
+        case KEY_LEFT:
+        case KEY_UP:
+          reserve_cal_page = (reserve_cal_page == 0) ? 1 : 0;
+          break;
+        case KEY_RIGHT:
+        case KEY_DOWN:
+          reserve_cal_page = (reserve_cal_page + 1u) % 2u;
+          break;
+        default:
+          break;
+      }
+      if (!isRepeat) beeperTrigger(BEEP_MS);
+      updateDisplay();
+      return;
+    }
 
     switch (key) {
       case KEY_SEL:
-        hwStepMulIdx = (uint8_t)((hwStepMulIdx + 1u) % 3u);
+        if (selected_row == 0) {
+          reserve_page = 1;
+          reserve_cal_page = 0;
+        } else {
+          hwStepMulIdx = (uint8_t)((hwStepMulIdx + 1u) % 3u);
+        }
         break;
       case KEY_UP:
-        if (selected_row > 1) {
+        if (selected_row == 0) {
+          if (count == 0) {
+            selected_row = 0;
+            hw_top = 0;
+          } else if (count <= 3) {
+            selected_row = count;
+            hw_top = 0;
+          } else {
+            hw_top = (uint8_t)(count - 3);
+            selected_row = 3;
+          }
+        } else if (selected_row > 1) {
           selected_row--;
+        } else if (selected_row == 1) {
+          selected_row = 0;
         } else if (hw_top > 0) {
           hw_top--;
         } else {
@@ -2392,8 +2660,18 @@ static void applyKeyPress(uint8_t key, bool isRepeat = false)
         }
         break;
       case KEY_DOWN:
-        if (count == 0) {
+        if (selected_row == 0) {
+          if (count == 0) {
+            selected_row = 0;
+            hw_top = 0;
+            break;
+          }
           selected_row = 1;
+          hw_top = 0;
+          break;
+        }
+        if (count == 0) {
+          selected_row = 0;
           hw_top = 0;
           break;
         }
@@ -2406,12 +2684,12 @@ static void applyKeyPress(uint8_t key, bool isRepeat = false)
           }
         } else {
           hw_top = 0;
-          selected_row = 1;
+          selected_row = 0;
         }
         break;
       case KEY_LEFT:
       case KEY_RIGHT:
-        if (selIdx < count) {
+        if (selIsItem && selIdx < count) {
           const HwItemDesc& d = kHwItems[selIdx];
           const uint32_t step = (uint32_t)d.step * (uint32_t)kHwStepMul[hwStepMulIdx];
           uint32_t v = hwGet(d.id);
@@ -2666,6 +2944,8 @@ static void syncModeSubmodeNow()
     in_submenu = false;
     selected_row = 1;
     hw_top = 0;
+    reserve_page = 0;
+    reserve_cal_page = 0;
   }
 
   const SubMode newSub = decodeSubmodeFromRawPd(last_pd8_10);
@@ -2721,10 +3001,14 @@ static void updateModeSubmodeFromSwitches()
       in_submenu = false;
       selected_row = 1;
       hw_top = 0;
+      reserve_page = 0;
+      reserve_cal_page = 0;
     } else if (prevMode == MODE_RESERVE) {
       in_submenu = false;
       selected_row = 0;
       hw_top = 0;
+      reserve_page = 0;
+      reserve_cal_page = 0;
     }
   }
   // Decode SUBMODE using raw PD9/PD10 low detection (more tolerant than bit patterns)

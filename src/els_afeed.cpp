@@ -7,12 +7,7 @@ namespace els_afeed {
 
 namespace {
 
-constexpr int32_t kReboundX = 1500;
-constexpr int32_t kReboundZ = 1500; /* 7e2_Mod...ino REBOUND_Z */
-constexpr int32_t kMotorXStepPerRev = 300;
-constexpr int32_t kScrewXHundredths = 150;
-constexpr int32_t kMcStepX = 4;
-constexpr int32_t kTol = 56; /* allow teach / rounding vs exact Arduino == positions */
+static Hardware s_hw = {1500, 1500, 300, 150, 4, 56};
 
 enum Var : uint8_t { VNone = 0, VExtL, VExtR, VIntL, VIntR, VExtUp, VExtDn };
 
@@ -55,13 +50,14 @@ static uint8_t s_prev_joy_u = 0;
 static int32_t infeed_u(uint16_t doc_x100)
 {
   const float ap = (float)doc_x100;
-  return (int32_t)lroundf((float)kMotorXStepPerRev * ap / (float)kScrewXHundredths * (float)kMcStepX);
+  return (int32_t)lroundf((float)s_hw.motor_x_steps_per_rev * ap / (float)s_hw.screw_x_hundredths *
+                          (float)s_hw.mcstep_x);
 }
 
 static bool near_eq(int32_t a, int32_t b)
 {
   const int32_t d = a - b;
-  return d <= kTol && d >= -kTol;
+  return d <= s_hw.tol && d >= -s_hw.tol;
 }
 
 /* Return-X target must stay inside taught X window; otherwise soft stop hits tr
@@ -82,10 +78,10 @@ static int32_t clamp_span(int32_t v, int32_t a, int32_t b)
 static void want_z_toward(int32_t mz, int32_t target, bool* wantZ, bool* zDir)
 {
   if (near_eq(mz, target)) return;
-  if (mz < target - kTol) {
+  if (mz < target - s_hw.tol) {
     *wantZ = true;
     *zDir = true;
-  } else if (mz > target + kTol) {
+  } else if (mz > target + s_hw.tol) {
     *wantZ = true;
     *zDir = false;
   }
@@ -107,6 +103,15 @@ static void machine_reset()
   s_soft_z_overlay = false;
   s_prev_joy_u = 0;
 }
+
+}  // namespace
+
+void setHardware(const Hardware& hw)
+{
+  s_hw = hw;
+}
+
+namespace {
 
 static Var pick_var(uint8_t sub, uint8_t joy)
 {
@@ -162,10 +167,11 @@ static bool tick_ext_l(
     arm_null(mx, pass_cur);
     s_w_infeed = infeed_u(doc_x100);
     if (s_w_infeed == 0) {
-      s_pass_x_target = (*pass_cur == 1) ? (s_null_x + 1) : (tr + kReboundX);
+      s_pass_x_target = (*pass_cur == 1) ? (s_null_x + 1) : (tr + s_hw.rebound_x);
     } else {
       s_pass_x_target =
-          (*pass_cur == 1) ? (s_null_x + s_w_infeed) : (tr + kReboundX + s_w_infeed * (int32_t)(*pass_cur));
+          (*pass_cur == 1) ? (s_null_x + s_w_infeed)
+                           : (tr + s_hw.rebound_x + s_w_infeed * (int32_t)(*pass_cur));
     }
     s_pass_x_target = std::min(s_pass_x_target, tf);
     s_dyn_cap_f = std::min(tf, s_pass_x_target);
@@ -177,7 +183,7 @@ static bool tick_ext_l(
   if (s_ph == PXf) {
     s_dyn_cap_f = std::min(tf, s_pass_x_target);
     s_dyn_cap_r = tr;
-    if (mx >= s_pass_x_target - kTol) {
+    if (mx >= s_pass_x_target - s_hw.tol) {
       s_ph = PZl;
     } else {
       *wantX = true;
@@ -189,9 +195,9 @@ static bool tick_ext_l(
   if (s_ph == PZl) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz <= lz + kTol) {
+    if (mz <= lz + s_hw.tol) {
       const int32_t eff_r = clamp_x_target_to_limits(
-          s_pass_x_target - kReboundX - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
+          s_pass_x_target - s_hw.rebound_x - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
       s_dyn_cap_r = std::max(tr, eff_r);
       s_dyn_cap_f = tf;
       s_ph = PXr;
@@ -204,10 +210,10 @@ static bool tick_ext_l(
 
   if (s_ph == PXr) {
     const int32_t eff_r = clamp_x_target_to_limits(
-        s_pass_x_target - kReboundX - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
+        s_pass_x_target - s_hw.rebound_x - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
     s_dyn_cap_r = std::max(tr, eff_r);
     s_dyn_cap_f = tf;
-    if (mx <= eff_r + kTol) {
+    if (mx <= eff_r + s_hw.tol) {
       if (*pass_cur < 255) (*pass_cur)++;
       s_ph = PZrRap;
     } else {
@@ -220,7 +226,7 @@ static bool tick_ext_l(
   if (s_ph == PZrRap) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz >= rz - kTol) {
+    if (mz >= rz - s_hw.tol) {
       s_ph = PIdle;
       s_soft_overlay = false;
       return false;
@@ -269,10 +275,11 @@ static bool tick_ext_r(
     arm_null(mx, pass_cur);
     s_w_infeed = infeed_u(doc_x100);
     if (s_w_infeed == 0) {
-      s_pass_x_target = (*pass_cur == 1) ? (s_null_x + 1) : (tr + kReboundX);
+      s_pass_x_target = (*pass_cur == 1) ? (s_null_x + 1) : (tr + s_hw.rebound_x);
     } else {
       s_pass_x_target =
-          (*pass_cur == 1) ? (s_null_x + s_w_infeed) : (tr + kReboundX + s_w_infeed * (int32_t)(*pass_cur));
+          (*pass_cur == 1) ? (s_null_x + s_w_infeed)
+                           : (tr + s_hw.rebound_x + s_w_infeed * (int32_t)(*pass_cur));
     }
     s_pass_x_target = std::min(s_pass_x_target, tf);
     s_dyn_cap_f = std::min(tf, s_pass_x_target);
@@ -284,7 +291,7 @@ static bool tick_ext_r(
   if (s_ph == PXf) {
     s_dyn_cap_f = std::min(tf, s_pass_x_target);
     s_dyn_cap_r = tr;
-    if (mx >= s_pass_x_target - kTol) {
+    if (mx >= s_pass_x_target - s_hw.tol) {
       s_ph = PZf; /* Z toward right */
     } else {
       *wantX = true;
@@ -296,9 +303,9 @@ static bool tick_ext_r(
   if (s_ph == PZf) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz >= rz - kTol) {
+    if (mz >= rz - s_hw.tol) {
       const int32_t eff_r = clamp_x_target_to_limits(
-          s_pass_x_target - kReboundX - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
+          s_pass_x_target - s_hw.rebound_x - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
       s_dyn_cap_r = std::max(tr, eff_r);
       s_dyn_cap_f = tf;
       s_ph = PXr;
@@ -311,10 +318,10 @@ static bool tick_ext_r(
 
   if (s_ph == PXr) {
     const int32_t eff_r = clamp_x_target_to_limits(
-        s_pass_x_target - kReboundX - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
+        s_pass_x_target - s_hw.rebound_x - s_w_infeed * (int32_t)(*pass_cur), tr, tf);
     s_dyn_cap_r = std::max(tr, eff_r);
     s_dyn_cap_f = tf;
-    if (mx <= eff_r + kTol) {
+    if (mx <= eff_r + s_hw.tol) {
       if (*pass_cur < 255) (*pass_cur)++;
       s_ph = PZrRapL;
     } else {
@@ -327,7 +334,7 @@ static bool tick_ext_r(
   if (s_ph == PZrRapL) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz <= lz + kTol) {
+    if (mz <= lz + s_hw.tol) {
       s_ph = PIdle;
       s_soft_overlay = false;
       return false;
@@ -379,10 +386,10 @@ static bool tick_int_l(
     s_w_infeed = infeed_u(doc_x100);
     int32_t eff_r;
     if (s_w_infeed == 0) {
-      eff_r = (*pass_cur == 1) ? (s_null_x - 1) : (tf - kReboundX);
+      eff_r = (*pass_cur == 1) ? (s_null_x - 1) : (tf - s_hw.rebound_x);
     } else {
       eff_r = (*pass_cur == 1) ? (s_null_x - s_w_infeed)
-                               : (tf - kReboundX - s_w_infeed * (int32_t)(*pass_cur));
+                               : (tf - s_hw.rebound_x - s_w_infeed * (int32_t)(*pass_cur));
     }
     eff_r = std::max(tr, eff_r);
     s_pass_x_target = eff_r;
@@ -395,7 +402,7 @@ static bool tick_int_l(
   if (s_ph == PXr) {
     s_dyn_cap_r = std::max(tr, s_pass_x_target);
     s_dyn_cap_f = tf;
-    if (mx <= s_pass_x_target + kTol) {
+    if (mx <= s_pass_x_target + s_hw.tol) {
       s_ph = PZl;
     } else {
       *wantX = true;
@@ -407,8 +414,8 @@ static bool tick_int_l(
   if (s_ph == PZl) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz <= lz + kTol) {
-      s_pass_x_target = tr + kReboundX + s_w_infeed * (int32_t)(*pass_cur);
+    if (mz <= lz + s_hw.tol) {
+      s_pass_x_target = tr + s_hw.rebound_x + s_w_infeed * (int32_t)(*pass_cur);
       s_pass_x_target = std::min(s_pass_x_target, tf);
       s_dyn_cap_f = std::min(tf, s_pass_x_target);
       s_dyn_cap_r = tr;
@@ -423,7 +430,7 @@ static bool tick_int_l(
   if (s_ph == PXf) {
     s_dyn_cap_f = std::min(tf, s_pass_x_target);
     s_dyn_cap_r = tr;
-    if (mx >= s_pass_x_target - kTol) {
+    if (mx >= s_pass_x_target - s_hw.tol) {
       if (*pass_cur < 255) (*pass_cur)++;
       s_ph = PZrRap;
     } else {
@@ -436,7 +443,7 @@ static bool tick_int_l(
   if (s_ph == PZrRap) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz >= rz - kTol) {
+    if (mz >= rz - s_hw.tol) {
       s_ph = PIdle;
       s_soft_overlay = false;
       return false;
@@ -488,10 +495,10 @@ static bool tick_int_r(
     s_w_infeed = infeed_u(doc_x100);
     int32_t eff_r;
     if (s_w_infeed == 0) {
-      eff_r = (*pass_cur == 1) ? (s_null_x - 1) : (tf - kReboundX);
+      eff_r = (*pass_cur == 1) ? (s_null_x - 1) : (tf - s_hw.rebound_x);
     } else {
       eff_r = (*pass_cur == 1) ? (s_null_x - s_w_infeed)
-                               : (tf - kReboundX - s_w_infeed * (int32_t)(*pass_cur));
+                               : (tf - s_hw.rebound_x - s_w_infeed * (int32_t)(*pass_cur));
     }
     eff_r = std::max(tr, eff_r);
     s_pass_x_target = eff_r;
@@ -504,7 +511,7 @@ static bool tick_int_r(
   if (s_ph == PXr) {
     s_dyn_cap_r = std::max(tr, s_pass_x_target);
     s_dyn_cap_f = tf;
-    if (mx <= s_pass_x_target + kTol) {
+    if (mx <= s_pass_x_target + s_hw.tol) {
       s_ph = PZf;
     } else {
       *wantX = true;
@@ -516,8 +523,8 @@ static bool tick_int_r(
   if (s_ph == PZf) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz >= rz - kTol) {
-      s_pass_x_target = tr + kReboundX + s_w_infeed * (int32_t)(*pass_cur);
+    if (mz >= rz - s_hw.tol) {
+      s_pass_x_target = tr + s_hw.rebound_x + s_w_infeed * (int32_t)(*pass_cur);
       s_pass_x_target = std::min(s_pass_x_target, tf);
       s_dyn_cap_f = std::min(tf, s_pass_x_target);
       s_dyn_cap_r = tr;
@@ -532,7 +539,7 @@ static bool tick_int_r(
   if (s_ph == PXf) {
     s_dyn_cap_f = std::min(tf, s_pass_x_target);
     s_dyn_cap_r = tr;
-    if (mx >= s_pass_x_target - kTol) {
+    if (mx >= s_pass_x_target - s_hw.tol) {
       if (*pass_cur < 255) (*pass_cur)++;
       s_ph = PZrRapL;
     } else {
@@ -545,7 +552,7 @@ static bool tick_int_r(
   if (s_ph == PZrRapL) {
     s_dyn_cap_f = tf;
     s_dyn_cap_r = tr;
-    if (mz <= lz + kTol) {
+    if (mz <= lz + s_hw.tol) {
       s_ph = PIdle;
       s_soft_overlay = false;
       return false;
@@ -597,10 +604,10 @@ static bool tick_ext_joy_up(
     s_w_infeed = infeed_u(doc_x100);
     int32_t z_stop;
     if (s_w_infeed == 0) {
-      z_stop = (*pass_cur == 1) ? ((s_null_z != 0) ? (s_null_z + 1) : (rz + 1)) : (rz + kReboundZ);
+      z_stop = (*pass_cur == 1) ? ((s_null_z != 0) ? (s_null_z + 1) : (rz + 1)) : (rz + s_hw.rebound_z);
     } else {
       z_stop = (*pass_cur == 1) ? ((s_null_z != 0) ? (s_null_z + s_w_infeed) : (rz + s_w_infeed))
-                                : (rz + kReboundZ + s_w_infeed);
+                                : (rz + s_hw.rebound_z + s_w_infeed);
     }
     s_pass_z_arm = clamp_span(z_stop, lz, rz);
     s_soft_z_overlay = true;
@@ -626,8 +633,8 @@ static bool tick_ext_joy_up(
 
   if (s_ph == EU_XtoF) {
     s_soft_z_overlay = false;
-    if (mx >= tf - kTol) {
-      s_z_inner = clamp_span(s_pass_z_arm - kReboundZ, lz, rz);
+    if (mx >= tf - s_hw.tol) {
+      s_z_inner = clamp_span(s_pass_z_arm - s_hw.rebound_z, lz, rz);
       s_soft_z_overlay = true;
       s_dyn_z_l = std::min(lz, rz);
       s_dyn_z_r = s_z_inner;
@@ -656,7 +663,7 @@ static bool tick_ext_joy_up(
 
   if (s_ph == EU_XrapR) {
     s_soft_z_overlay = false;
-    if (mx <= tr + kTol) {
+    if (mx <= tr + s_hw.tol) {
       if (*pass_cur < 255) (*pass_cur)++;
       s_ph = PIdle;
       return false;
@@ -708,10 +715,10 @@ static bool tick_ext_joy_dn(
     s_w_infeed = infeed_u(doc_x100);
     int32_t z_stop;
     if (s_w_infeed == 0) {
-      z_stop = (*pass_cur == 1) ? ((s_null_z != 0) ? (s_null_z + 1) : (rz + 1)) : (rz + kReboundZ);
+      z_stop = (*pass_cur == 1) ? ((s_null_z != 0) ? (s_null_z + 1) : (rz + 1)) : (rz + s_hw.rebound_z);
     } else {
       z_stop = (*pass_cur == 1) ? ((s_null_z != 0) ? (s_null_z + s_w_infeed) : (rz + s_w_infeed))
-                                : (rz + kReboundZ + s_w_infeed);
+                                : (rz + s_hw.rebound_z + s_w_infeed);
     }
     s_pass_z_arm = clamp_span(z_stop, lz, rz);
     s_soft_z_overlay = true;
@@ -737,8 +744,8 @@ static bool tick_ext_joy_dn(
 
   if (s_ph == ED_XtoR) {
     s_soft_z_overlay = false;
-    if (mx <= tr + kTol) {
-      s_z_inner = clamp_span(s_pass_z_arm - kReboundZ, lz, rz);
+    if (mx <= tr + s_hw.tol) {
+      s_z_inner = clamp_span(s_pass_z_arm - s_hw.rebound_z, lz, rz);
       s_soft_z_overlay = true;
       s_dyn_z_l = std::min(lz, rz);
       s_dyn_z_r = s_z_inner;
@@ -767,7 +774,7 @@ static bool tick_ext_joy_dn(
 
   if (s_ph == ED_XrapF) {
     s_soft_z_overlay = false;
-    if (mx >= tf - kTol) {
+    if (mx >= tf - s_hw.tol) {
       if (*pass_cur < 255) (*pass_cur)++;
       s_ph = PIdle;
       return false;
